@@ -1,0 +1,736 @@
+# Industrial-Scale Corporate Bond Relative Value Platform
+## Technical Design and Implementation Guide
+
+Prepared for a greenfield Python-based build  
+Date: March 12, 2026
+
+## Document Status
+
+**Purpose**: This document specifies the target architecture, engineering design, operating model, and implementation roadmap for a production-grade corporate bond relative value platform.
+
+**Scope**: The system is designed for a **greenfield**, **Python-only**, **bond-first** implementation with **CDS integration in phase 2**. The platform must support approximately **200,000 bonds**, **2,000+ issuers**, **3-4 production runs per day**, and approximately **5 downstream consuming systems**.
+
+**Design Intent**: This is a batch-first institutional analytics platform. The immediate objective is not millisecond execution. The objective is correctness, reproducibility, coverage, auditability, and operational resilience.
+
+## Executive Summary
+
+The platform should be built as a layered analytics system rather than as a single research codebase or monolithic script. The quantitative model described in the technical framework depends on consistent implementation of risk-free curves, hazard curves, risky PV01, expected loss, bond pricing, par-adjusted spread, residual computation, and curve selection logic. In production, these calculations must be supported by industrial data pipelines, stable schemas, run metadata, publication controls, and operational monitoring.
+
+The correct architecture is a modular batch platform with the following major layers:
+
+- Immutable raw data ingestion
+- Validation, normalization, and canonicalization
+- Shared quantitative core library
+- Curve calibration engine for issuer, sector-rating, and fallback curves
+- Signal generation engine for residuals, z-scores, and published signals
+- Serving layer for downstream systems and diagnostics
+- Monitoring, governance, audit, and historical replay
+
+This design is intended to support long-term institutional operation. It prioritizes deterministic reruns, explainability of every published signal, and a clear path to phase 2 CDS integration without replacing the phase 1 platform.
+
+## Business Objective
+
+The system must identify rich and cheap bonds relative to fitted credit curves and publish those analytics in a controlled production workflow. Specifically, the platform must:
+
+1. Fit issuer-specific curves when enough eligible issuer bonds are available.
+2. Fit sector-rating curves when issuer-level fitting is underdetermined.
+3. Fit rating-only fallback curves for residual sparse regions of the universe.
+4. Assign the best available curve to each eligible bond according to a deterministic priority policy.
+5. Compute par-adjusted spreads, fitted spreads, spread residuals, price residuals, and z-scores.
+6. Publish both raw bond analytics and filtered signals for consumption by internal or downstream systems.
+7. Support daily production and historical replay with complete auditability.
+
+## Target Scale and Assumptions
+
+### Scale Targets
+
+- Bond universe: 200,000 instruments
+- Issuer count: 2,000+ issuers
+- Run frequency: 3-4 batch runs per business day
+- Downstream systems: approximately 5
+- Deployment style: batch-first analytics platform
+
+### Assumptions
+
+- Language constraint: Python only for core engineering implementation
+- Initial scope excludes CDS from production logic
+- Callable and putable bonds are excluded unless explicit valuation support is introduced
+- The first hazard model in production is exponential hazard, with more complex forms reserved for controlled later phases
+- The system is deployed in containers and orchestrated through a workflow scheduler
+
+## Architectural Principles
+
+1. **Single source of quantitative truth**. All core formulas must live in one shared Python package used by both batch processing and serving layers.
+2. **Deterministic batch execution**. Every published result must be reproducible for any as-of date.
+3. **Immutable raw storage**. Raw source snapshots are append-only and never overwritten.
+4. **Explicit publication workflow**. Draft results are not automatically visible to downstream consumers.
+5. **Failure isolation**. One issuer or one sector bucket failing calibration must not fail the entire run.
+6. **Audit by design**. Every number must be attributable to source snapshot, model version, config version, and code revision.
+7. **Operational transparency**. Rejections, calibration failures, degraded fallbacks, and coverage gaps must be measurable and visible.
+8. **Progressive extensibility**. CDS integration should attach cleanly to the calibration layer in phase 2.
+
+## Scope
+
+### In Scope
+
+- Raw ingestion of bond, rates, and reference data
+- Validation and canonicalization of production analytics inputs
+- Risk-free curve construction and validation
+- Issuer curve fitting
+- Sector-rating curve fitting
+- Rating-only fallback curve fitting
+- Curve assignment by bond
+- Residual, z-score, and signal generation
+- Read-only APIs and downstream publication interfaces
+- Monitoring, alerting, run metadata, and historical replay
+
+### Out of Scope for Phase 1
+
+- CDS-driven calibration and bond-CDS basis analytics
+- Real-time streaming signal recomputation
+- Advanced optionality models for callable and putable securities
+- Automated analyst override workflow
+- User interface design beyond basic diagnostics and dashboards
+
+## Functional Requirements
+
+### Core Analytics Requirements
+
+The system shall:
+
+- Load bond snapshots with clean prices, coupon, maturity, sector, rating, issuer mapping, and fit eligibility flags
+- Construct risk-free discount and forward curves for each run timestamp
+- Fit hazard-based survival curves with bounded optimization and multiple initial guesses
+- Compute risky PV01, expected loss, risky-weighted forward rate, and parity validation
+- Price bonds from fitted survival curves
+- Compute par-adjusted spread and fitted par spread for each bond
+- Compute residuals in spread and price units
+- Compute z-scores using historical residual distributions
+- Produce signal objects with direction, magnitude, confidence, and metadata
+
+### Operational Requirements
+
+The system shall:
+
+- Execute 3-4 times daily without manual intervention
+- Provide deterministic reruns for historical business dates
+- Persist rejected records with reason codes
+- Persist calibration diagnostics and publication states
+- Expose API-ready tables for downstream systems
+- Publish monitoring metrics on data quality, calibration quality, coverage, and latency
+
+## Non-Functional Requirements
+
+| Requirement | Design Expectation |
+|---|---|
+| Scalability | Support 200,000 bonds without redesign of the core operating model. |
+| Reliability | Complete runs despite partial partition failures. |
+| Reproducibility | Support exact reruns using stored snapshots, configs, and code references. |
+| Auditability | Every output traceable to run, source data, model version, and publication. |
+| Maintainability | Python-only codebase with clear module boundaries and shared libraries. |
+| Extensibility | Allow later CDS integration without replacing phase 1 data and batch foundations. |
+| Observability | Operational dashboards and alerts for source freshness, fit quality, and output drift. |
+| Security | Controlled access to serving interfaces and separation between raw data and published outputs. |
+
+## Logical Architecture
+
+### Layered View
+
+1. **Raw Data Ingestion Layer**
+2. **Validation and Canonicalization Layer**
+3. **Quantitative Core Layer**
+4. **Curve Calibration Layer**
+5. **Curve Assignment and Signal Layer**
+6. **Serving Layer**
+7. **Monitoring and Governance Layer**
+
+### Data Flow
+
+The production data flow is:
+
+1. Ingest raw source snapshots.
+2. Validate structural integrity and source completeness.
+3. Canonicalize identifiers and normalize attributes.
+4. Build curated analytics snapshot.
+5. Build risk-free curve snapshot.
+6. Fit issuer curves.
+7. Fit sector-rating curves excluding issuers that already have issuer curves.
+8. Fit rating fallback curves.
+9. Run calibration quality gates.
+10. Publish approved curves.
+11. Assign the best available curve to each bond.
+12. Compute residuals, z-scores, and signals.
+13. Publish downstream-facing tables and APIs.
+14. Update monitoring metrics and reports.
+
+## Service Design
+
+### Service 1: Market Data Ingestion
+
+**Purpose**: Acquire source truth and persist immutable raw records.
+
+**Responsibilities**:
+
+- Pull or receive bond market data snapshots
+- Pull or receive Treasury or risk-free curve snapshots
+- Pull or receive reference data snapshots
+- Validate payload presence and basic schema shape
+- Persist source snapshots to raw immutable storage
+- Create ingestion manifests with timestamp, source, file fingerprint, and completeness status
+
+**Inputs**:
+
+- Bond prices and metadata
+- Treasury curve data
+- Issuer, sector, rating, and instrument reference data
+
+**Outputs**:
+
+- Raw bond quote tables or files
+- Raw rates curve tables or files
+- Raw reference entity tables or files
+- Ingestion run metadata
+
+**Key Rules**:
+
+- Raw data is append-only
+- Ingestion does not apply analytics filters
+- Source schema drift is treated as an operational alert
+
+### Service 2: Validation and Canonicalization
+
+**Purpose**: Convert raw source records into analytics-grade curated inputs.
+
+**Responsibilities**:
+
+- Null and type validation
+- Identifier mapping for instruments and issuers
+- Sector and rating normalization
+- Maturity and lifecycle checks
+- Fit eligibility classification
+- Rejection reason persistence
+
+**Representative validation rules**:
+
+- Missing price, coupon, maturity, or issuer mapping causes rejection from fitting
+- Very distressed bonds below configured price thresholds are excluded from calibration
+- Very short-dated bonds are excluded from calibration
+- Callable and putable bonds are excluded in phase 1 unless flagged otherwise
+
+**Outputs**:
+
+- Curated bond snapshot
+- Curated rates snapshot
+- Curated reference snapshot
+- Validation and rejection reports
+
+### Service 3: Risk-Free Curve Service
+
+**Purpose**: Provide discount factors and forward rates used throughout calibration and signal generation.
+
+**Responsibilities**:
+
+- Load curated Treasury data
+- Construct interpolated discount factor and forward rate functions
+- Validate monotonic discounting and positive or acceptable forward behavior
+- Expose standardized methods for downstream quant logic
+
+**Contract**:
+
+- `discount_factor(t)`
+- `forward_rate(t)`
+- curve diagnostics and metadata
+
+### Service 4: Quantitative Core
+
+**Purpose**: Implement all production mathematics in one versioned shared package.
+
+**Required modules**:
+
+- risk-free curve logic
+- exponential hazard model
+- survival probability
+- risky PV01
+- expected loss
+- risky-weighted forward rate
+- bond pricer
+- par-adjusted spread
+- fitted spread
+- residual and price residual calculations
+- optimization interfaces and diagnostics
+- parity checks
+
+**Design rules**:
+
+- No database dependencies inside the quantitative core
+- Prefer pure functions and explicit data objects
+- Include numerical regression fixtures and invariants
+
+### Service 5: Curve Builder
+
+**Purpose**: Calibrate and publish issuer, sector-rating, and rating-only curves.
+
+**Responsibilities**:
+
+- Partition eligible bonds by issuer and calibration bucket
+- Run bounded optimization with multiple initial guesses
+- Enforce positive hazard and monotonic survival properties
+- Compute RMSE, max residual, and coverage diagnostics
+- Publish accepted curves and mark degraded or failed results
+
+**Calibration hierarchy**:
+
+1. Issuer curve if issuer has at least 3 eligible bonds.
+2. Sector-rating curve if issuer curve is unavailable.
+3. Rating-only fallback if sector-rating curve is unavailable.
+
+**Failure handling**:
+
+- An issuer calibration failure must not halt the run
+- Failed issuers fall back to lower-priority curve types if available
+- Failures and degraded outputs are persisted as explicit statuses
+
+### Service 6: Curve Assignment
+
+**Purpose**: Assign a published best-available curve to each bond.
+
+**Priority logic**:
+
+1. Issuer
+2. Sector-rating
+3. Rating-only
+4. Uncovered
+
+**Reason for a separate service**: Downstream consumers must not implement their own assignment logic. The platform must publish one authoritative assignment table.
+
+### Service 7: Signal Engine
+
+**Purpose**: Convert approved curves into bond-level analytics and signals.
+
+**Responsibilities**:
+
+- Compute actual par-adjusted spreads
+- Compute fitted spreads from assigned curves
+- Compute spread residuals and price residuals
+- Compute historical z-scores
+- Apply signal thresholds and suppression rules
+- Publish raw analytics separately from filtered tradeable signals
+
+**Signal policy notes**:
+
+- Raw residuals must remain available even if tradeable signals are suppressed
+- Suppressions may include stale quotes, obvious data errors, distressed instruments, or corporate action flags
+
+### Service 8: API and Delivery
+
+**Purpose**: Expose read-only production outputs to internal and downstream systems.
+
+**Representative endpoints**:
+
+- latest run metadata
+- curve diagnostics
+- bond analytics by identifier
+- latest and historical signals
+- coverage and quality summaries
+
+**Requirements**:
+
+- Only published outputs are exposed
+- Contracts are versioned and stable
+- Pagination and filtering are supported
+
+### Service 9: Monitoring and Governance
+
+**Purpose**: Maintain operational and model control.
+
+**Responsibilities**:
+
+- Monitor source freshness and completeness
+- Monitor rejection rates and eligibility counts
+- Monitor calibration quality and coverage drift
+- Track publication versions, model versions, and code revisions
+- Support incident analysis and historical replay
+
+## Data Model
+
+### Core Entities
+
+| Entity | Purpose |
+|---|---|
+| `ingestion_run` | Metadata for raw source intake. |
+| `raw_bond_quote` | Immutable bond source records. |
+| `raw_rates_curve` | Immutable Treasury or rates source records. |
+| `raw_reference_entity` | Immutable source reference data. |
+| `curated_bond_snapshot` | Normalized analytics-ready bond snapshot. |
+| `curated_rates_snapshot` | Validated rates snapshot for a run. |
+| `curve_run` | Metadata for a calibration run. |
+| `curve_parameters` | Stored model parameters per published curve. |
+| `curve_quality_metrics` | RMSE, max residual, convergence status, diagnostics. |
+| `curve_instrument_membership` | Instruments used for a curve calibration. |
+| `curve_publication` | Publication state and versioning for curves. |
+| `bond_curve_assignment` | Best available curve selected for each bond. |
+| `bond_residual` | Spread and price residual outputs. |
+| `bond_zscore` | Historical normalization outputs. |
+| `bond_signal` | Published signal records. |
+| `model_registry_entry` | Code, config, and model version linkage. |
+
+### Traceability Requirements
+
+Every analytical result must be traceable to:
+
+- run identifier
+- valuation timestamp
+- input snapshot identifiers
+- model version
+- configuration version
+- code revision
+- publication identifier
+
+## Quantitative Design Constraints
+
+The production platform must preserve the mathematical invariants required by the technical framework. At minimum:
+
+- The risk-free curve object must produce stable discount factors and forward rates
+- The survival curve must remain valid over the operating horizon
+- Risky PV01, expected loss, and risky-weighted forward calculations must satisfy parity checks to within configured numerical tolerance
+- Bond pricing must be consistent between calibration and analytics generation
+- Residual calculations must use exactly the same definitions throughout the platform
+
+### Critical Invariant
+
+The parity equation must be validated as a first-class production control:
+
+`B(T)Q(T) + Xi(T) + r_b(T)Pi(T) = 1`
+
+If this identity fails beyond tolerance, the run must be considered quantitatively invalid for affected instruments or curves.
+
+## Quality Gates
+
+### Curve Publication Gates
+
+Each candidate curve must pass:
+
+1. optimizer convergence
+2. valid bounded parameter set
+3. positive hazard over the operating horizon
+4. monotonic survival probability
+5. parity check support for the numerical implementation
+6. RMSE below configured thresholds for the curve class
+7. max residual below configured hard cap
+8. minimum instrument count for the curve class
+
+### Run-Level Gates
+
+The run should monitor:
+
+- source completeness
+- curated universe size
+- issuer curve count
+- sector-rating curve count
+- uncovered bond count
+- calibration failure count
+- published signal count
+- end-to-end runtime
+
+## Technology Recommendation
+
+### Core Stack
+
+- Python for all services and shared libraries
+- FastAPI for serving
+- PostgreSQL for operational and serving data
+- Object storage for raw snapshots and artifacts
+- Airflow or Dagster for orchestration
+- Docker for packaging
+- Prometheus and Grafana or equivalent for metrics and dashboards
+
+### Why This Stack
+
+This combination is sufficient for the required scale, friendly to a Python-only team, and compatible with a modular architecture in which quantitative logic remains reusable across batch, backfill, and serving workflows.
+
+## Repository Structure
+
+The recommended repository structure is shown below. The most important design rule is that `quant_core` remains independent from workflow and API concerns.
+
+```text
+relval-platform/
+  src/relval/common/
+  src/relval/domain/
+  src/relval/data_access/
+  src/relval/ingestion/
+  src/relval/validation/
+  src/relval/canonicalization/
+  src/relval/quant_core/
+  src/relval/curve_builder/
+  src/relval/signal_engine/
+  src/relval/backtest/
+  src/relval/api/
+  src/relval/workflows/
+  src/relval/monitoring/
+  src/relval/cli/
+  configs/
+  schemas/
+  tests/
+  docs/
+  scripts/
+```
+
+## Implementation Roadmap
+
+### Implementation Strategy
+
+Build the platform in the order that minimizes rework and operational risk. Do not start with APIs, dashboards, or deployment automation before the data contracts and quantitative core are correct.
+
+### Step-by-Step Plan
+
+#### Phase 0: Foundational Decisions
+
+1. Define business glossary and domain naming conventions.
+2. Define fit eligibility policy for bonds.
+3. Define curve hierarchy and fallback rules.
+4. Define publication states: draft, validated, published, rejected.
+5. Define versioning for model, configs, and code revisions.
+
+**Deliverables**: domain glossary, naming conventions, versioning policy, publication state model.
+
+#### Phase 1: Repository and Engineering Scaffolding
+
+1. Create repository layout.
+2. Configure packaging with `pyproject.toml`.
+3. Add linting, formatting, typing, and test tooling.
+4. Add CI for unit tests and static checks.
+5. Implement configuration loading, logging, and shared utilities.
+
+**Deliverables**: working repo, CI baseline, config framework, logging primitives.
+
+#### Phase 2: Data Contracts and Storage
+
+1. Define raw schemas.
+2. Define curated schemas.
+3. Define analytics and publication schemas.
+4. Add migrations and schema version control.
+5. Write data dictionary and entity descriptions.
+
+**Deliverables**: schema DDL, migration setup, data dictionary.
+
+#### Phase 3: Raw Ingestion
+
+1. Build bond feed ingestion.
+2. Build rates feed ingestion.
+3. Build reference data ingestion.
+4. Store raw immutable snapshots.
+5. Track manifests and source completeness.
+
+**Deliverables**: source loaders, immutable raw storage, manifest reporting.
+
+#### Phase 4: Validation and Canonicalization
+
+1. Implement issuer and instrument mapping.
+2. Normalize sector and rating taxonomies.
+3. Add bond validation and eligibility rules.
+4. Classify valid, invalid, and not-fit-eligible records.
+5. Generate curated analytics-ready snapshots.
+
+**Deliverables**: curated snapshots, rejection tables, eligibility flags.
+
+#### Phase 5: Risk-Free Curve Module
+
+1. Implement risk-free curve interpolation.
+2. Implement discount factor and forward rate methods.
+3. Add monotonicity and positivity checks.
+4. Build regression fixtures and tests.
+5. Persist approved risk-free curve snapshots.
+
+**Deliverables**: tested risk-free curve component and snapshot persistence.
+
+#### Phase 6: Quant Core Mathematics
+
+1. Implement exponential hazard model.
+2. Implement survival probability.
+3. Implement risky PV01.
+4. Implement expected loss.
+5. Implement risky-weighted forward rate.
+6. Implement parity validation.
+7. Implement bond pricing function.
+8. Implement par-adjusted spread and fitted spread calculations.
+9. Add unit tests and golden fixtures.
+
+**Deliverables**: first production-grade quantitative core package.
+
+#### Phase 7: Optimization Engine
+
+1. Implement objective function and weighted residual handling.
+2. Implement parameter bounds and validation.
+3. Implement multiple initial guesses.
+4. Add robust loss support for outliers.
+5. Return diagnostic-rich results rather than only fitted parameters.
+
+**Deliverables**: optimization module and calibration diagnostics suite.
+
+#### Phase 8: Issuer Curve Pipeline
+
+1. Implement issuer bond selection.
+2. Fit issuer curves for issuers with sufficient coverage.
+3. Apply quality gates.
+4. Persist curves and diagnostics.
+5. Report issuer coverage and failures.
+
+**Deliverables**: end-to-end issuer calibration pipeline.
+
+#### Phase 9: Sector-Rating and Fallback Curves
+
+1. Define sector-rating grid.
+2. Exclude issuers with issuer curves from sector calibration.
+3. Fit sector-rating curves.
+4. Fit rating-only fallback curves.
+5. Persist diagnostics and coverage metrics.
+
+**Deliverables**: broad-universe curve coverage framework.
+
+#### Phase 10: Curve Assignment
+
+1. Implement assignment priority logic.
+2. Assign best available curve to each bond.
+3. Persist assignments with reasons and curve type.
+4. Publish no-coverage reports.
+
+**Deliverables**: bond-to-curve assignment table and coverage reporting.
+
+#### Phase 11: Signal Generation
+
+1. Compute actual and fitted spreads.
+2. Compute spread residuals and price residuals.
+3. Compute rolling z-scores.
+4. Implement threshold-based signal generation.
+5. Implement signal suppression rules.
+6. Publish raw analytics and filtered signals separately.
+
+**Deliverables**: residual tables, z-score tables, signal tables.
+
+#### Phase 12: Workflow Orchestration
+
+1. Implement production workflow DAGs.
+2. Add retries and dependency management.
+3. Add failed-step reruns.
+4. Add historical backfill support.
+5. Add publication checkpoints.
+
+**Deliverables**: production workflows, rerun playbooks, backfill controls.
+
+#### Phase 13: Serving Layer
+
+1. Build read-only APIs.
+2. Expose runs, curves, bond analytics, and signals.
+3. Define downstream contracts.
+4. Add authentication and authorization if required.
+5. Add pagination and freshness semantics.
+
+**Deliverables**: API service and downstream integration guide.
+
+#### Phase 14: Monitoring and Governance
+
+1. Add source freshness metrics.
+2. Add rejection and eligibility dashboards.
+3. Add calibration quality dashboards.
+4. Add coverage and runtime dashboards.
+5. Add model registry and config fingerprint tracking.
+
+**Deliverables**: dashboards, alerts, runbooks, governance metadata.
+
+#### Phase 15: Historical Replay and Model Governance
+
+1. Implement historical replay using production data contracts.
+2. Compare model versions over sample windows.
+3. Document expected residual behavior and model caveats.
+4. Define controlled model change approval workflow.
+5. Prepare extension points for CDS phase 2.
+
+**Deliverables**: replay framework, governance process, phase 2 readiness.
+
+## Strict Priority Order
+
+If sequencing must be reduced to a strict list, build in this order:
+
+1. Freeze domain rules and configuration conventions.
+2. Create repository and engineering scaffolding.
+3. Define schemas and storage contracts.
+4. Build raw ingestion.
+5. Build validation and canonicalization.
+6. Build the risk-free curve module.
+7. Build the quantitative core mathematics library.
+8. Build the optimization engine.
+9. Build issuer curve calibration.
+10. Build sector-rating and fallback curve calibration.
+11. Build curve assignment.
+12. Build residual and signal generation.
+13. Build workflow orchestration.
+14. Build APIs and delivery interfaces.
+15. Build monitoring and governance.
+16. Build historical replay.
+17. Add CDS integration as phase 2.
+
+## Milestones
+
+### Milestone 1: Data Foundation
+
+- repository
+- schemas
+- raw ingestion
+- curated snapshots
+- risk-free curve module
+
+### Milestone 2: Curve Engine
+
+- quantitative core
+- parity and numeric tests
+- optimization engine
+- issuer curves
+
+### Milestone 3: Full Coverage Analytics
+
+- sector-rating curves
+- rating-only fallbacks
+- curve assignment
+- residual engine
+
+### Milestone 4: Productionization
+
+- orchestration
+- publication controls
+- APIs
+- monitoring
+- runbooks
+
+### Milestone 5: Institutionalization
+
+- historical replay
+- governance process
+- model registry
+- CDS phase 2 preparation
+
+## Major Risks and Early Control Measures
+
+| Risk | Control |
+|---|---|
+| Poor issuer and instrument mapping | Treat canonicalization as a first-class service and persist rejection reasons. |
+| Hidden data quality issues in prices or maturities | Add explicit quality rules and diagnostics before calibration. |
+| Inconsistent mathematics between research and production | Enforce a single shared quantitative core package. |
+| Assignment logic duplicated across consumers | Publish one authoritative curve assignment table. |
+| Lack of audit trail for published outputs | Persist run, config, code, and publication metadata with every output. |
+| Over-engineering deployment too early | Prioritize quantitative correctness and stable schemas before platform complexity. |
+
+## Phase 2 Extension: CDS
+
+The phase 1 architecture is intentionally structured so CDS can be introduced without replacing the platform:
+
+- ingestion adds CDS quote sources
+- canonicalization adds RED code and maturity normalization
+- quant core adds ISDA-style RPV01 and CDS pricing support
+- calibration objective adds joint bond plus CDS fitting
+- signal engine adds bond-CDS basis analytics
+
+This should be a modular extension to existing services rather than a redesign.
+
+## Conclusion
+
+An industrial-scale bond relative value platform should be built as a disciplined analytics production system, not as a loose collection of notebooks, research scripts, or point tools. The immediate priorities are stable data contracts, clean quantitative boundaries, controlled calibration workflows, and full auditability of published outputs. If the platform is built in the prescribed order, the resulting system will support large-scale coverage, reproducible daily production, robust downstream delivery, and a clean upgrade path into CDS-enhanced calibration.

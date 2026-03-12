@@ -1,0 +1,2109 @@
+% Corporate Bond Relative Value Framework - Technical Implementation Guide
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{tcolorbox}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+% Color definitions
+\definecolor{keypoint}{RGB}{0,102,204}
+\definecolor{warning}{RGB}{204,0,0}
+\definecolor{implementation}{RGB}{0,153,76}
+\definecolor{formula}{RGB}{102,0,204}
+\definecolor{codebg}{RGB}{245,245,245}
+
+% Custom boxes
+\newtcolorbox{keybox}{
+  colback=keypoint!5!white,
+  colframe=keypoint!75!black,
+  title=\textbf{Key Concept}
+}
+
+\newtcolorbox{warnbox}{
+  colback=warning!5!white,
+  colframe=warning!75!black,
+  title=\textbf{⚠ Critical Implementation Detail}
+}
+
+\newtcolorbox{implbox}{
+  colback=implementation!5!white,
+  colframe=implementation!75!black,
+  title=\textbf{Implementation Guide}
+}
+
+\newtcolorbox{examplebox}{
+  colback=yellow!10!white,
+  colframe=yellow!50!black,
+  title=\textbf{Worked Example}
+}
+
+% Code listing style
+\lstset{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  language=Python
+}
+
+% Title
+\title{\textbf{Corporate Bond Relative Value Framework}\\
+\large Technical Implementation Guide}
+\author{Quantitative Credit Team}
+\date{March 12, 2026 - Version 1.0}
+
+\begin{document}
+
+\maketitle
+
+\tableofcontents
+\newpage
+
+%=============================================================================
+\section{Executive Summary}
+%=============================================================================
+
+\begin{keybox}
+This document provides \textbf{detailed technical implementation guidance} for building a corporate bond relative value system. It is organized into two main parts:
+
+\begin{enumerate}
+    \item \textbf{PART I}: Bond-Only Framework (no CDS data required)
+    \item \textbf{PART II}: CDS-Extended Framework (when CDS data available)
+\end{enumerate}
+
+The framework enables:
+\begin{itemize}
+    \item Fitting survival curves to bond prices
+    \item Identifying bonds trading rich/cheap to curves
+    \item Generating relative value signals across multiple strategies
+    \item Historical backtesting and live signal production
+\end{itemize}
+\end{keybox}
+
+\subsection{What You Already Have vs What You Need to Build}
+
+\begin{implbox}
+\textbf{Assumption: You have CR01 available from your existing system.}
+
+\textbf{CR01} (Credit Risk 01) = Dollar value change for 1bp parallel shift in credit spread curve.
+
+\textbf{Question}: Is CR01 enough, or do we need Risky PV01 ($\Pi$)?
+
+\textbf{Answer}: \textcolor{warning}{\textbf{You need BOTH, and they are DIFFERENT.}}
+
+\vspace{0.3cm}
+\noindent
+\begin{tabular}{p{3cm}p{4cm}p{6cm}}
+\toprule
+\textbf{Metric} & \textbf{Definition} & \textbf{Use Case} \\
+\midrule
+\textbf{CR01} & DV01 of credit spread, $\approx \frac{\partial P}{\partial s}$ & Hedging spread risk, Portfolio risk reporting \\
+\midrule
+\textbf{Risky PV01 ($\Pi$)} & $\int_0^T B(t)Q(t)dt$ & Curve fitting, Par-adjusted spread calculation, Total return attribution \\
+\bottomrule
+\end{tabular}
+\vspace{0.3cm}
+
+\textbf{Key Difference}:
+\begin{itemize}
+    \item \textbf{CR01}: Practical risk metric, depends on your spread convention (OAS, Z-spread, etc.)
+    \item \textbf{Risky PV01 ($\Pi$)}: Theoretical quantity, integral of survival-weighted discount factors
+\end{itemize}
+
+\textbf{Relationship}: 
+For bonds near par, CR01 $\approx \Pi \times 0.0001$ (i.e., \$CR01 per \$1mm notional $\approx 100 \times \Pi$).
+
+\textbf{Bottom Line}: \textcolor{keypoint}{\textbf{Build $\Pi$ calculation as part of this framework.}} You cannot use CR01 as a substitute because $\Pi$ is intrinsic to the survival curve mathematics.
+\end{implbox}
+
+%=============================================================================
+\section{PART I: BOND-ONLY FRAMEWORK}
+%=============================================================================
+
+%=============================================================================
+\subsection{The Fundamental Problem: Why Existing Spread Measures Fail}
+%=============================================================================
+
+\begin{warnbox}
+\textbf{The Core Issue}: Traditional spread measures (Z-spread, I-spread, ASW) systematically misprice bonds based on their coupon rate, NOT their true credit risk.
+
+\textbf{Consequence}: High-coupon bonds appear "rich" (expensive), low-coupon bonds appear "cheap", even when they have identical credit risk.
+
+\textbf{Root Cause}: These measures assume \textbf{zero recovery} ($\mathcal{R}=0$), which is empirically wrong (actual recovery $\approx 40\%$ for senior unsecured).
+\end{warnbox}
+
+\subsubsection{Concrete Example: COLOM '24 Bonds}
+
+\begin{examplebox}
+\textbf{Date}: April 8, 2016\\
+\textbf{Issuer}: Republic of Colombia\\
+\textbf{Two bonds, same credit risk, different coupons:}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Characteristic} & \textbf{Bond 1} & \textbf{Bond 2} \\
+\midrule
+Coupon & 4.0\% & 8.125\% \\
+Maturity & 7.88 years & 8.11 years \\
+Price & 100.10 & 125.50 \\
+Yield & 3.98\% & 4.36\% \\
+\midrule
+\textbf{Z-Spread} (assuming $\mathcal{R}=0$) & \textbf{Lower} & \textbf{Higher} \\
+\textbf{True Credit Risk} & \textbf{SAME} & \textbf{SAME} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Z-Spread Analysis} (flawed):
+\begin{itemize}
+    \item Bond 2 has higher Z-spread than Bond 1
+    \item Naive interpretation: Bond 2 is "cheap", Bond 1 is "rich"
+    \item \textcolor{warning}{\textbf{ERROR}}: This is an artifact of the high coupon, NOT a real mispricing
+    \item Actual price difference: Bond 2 appears \textbf{3 points cheap} using Z-spread
+\end{itemize}
+
+\textbf{Survival Curve Analysis} (correct, with $\mathcal{R}=40\%$):
+\begin{itemize}
+    \item Both bonds price correctly to the same survival curve
+    \item Spread residuals: $\Delta s_1 \approx 0$, $\Delta s_2 \approx 0$
+    \item \textcolor{implementation}{\textbf{CORRECT}}: No mispricing, both bonds fairly valued
+\end{itemize}
+
+\textbf{Intuition}: High-coupon bonds have more cash flow weighted toward early dates. If default occurs, you lose less principal (more already paid back). This \textbf{lower default loss} justifies the higher price, NOT a credit mispricing.
+\end{examplebox}
+
+%=============================================================================
+\subsection{The Mathematics: Survival Curves and Hazard Rates}
+%=============================================================================
+
+\subsubsection{Bond Pricing with Survival Probability}
+
+\begin{keybox}
+The \textbf{correct} way to price a risky bond incorporates three components:
+
+\begin{equation}
+\frac{P}{100} = \underbrace{\sum_{i=1}^{N} c \cdot B(t_i)Q(t_i)\Delta t}_{\text{PV of coupons}} + \underbrace{100 \cdot B(T)Q(T)}_{\text{PV of principal}} + \underbrace{\mathcal{R} \int_0^T B(t)dQ(t)}_{\text{PV of recovery}}
+\end{equation}
+
+Where:
+\begin{itemize}
+    \item $P$ = Clean bond price (\% of par)
+    \item $c$ = Annual coupon rate (\%)
+    \item $B(t)$ = Risk-free discount factor at time $t$ (from Treasury curve)
+    \item $Q(t)$ = Survival probability to time $t$ (\textbf{THIS IS WHAT WE FIT})
+    \item $T$ = Maturity (years)
+    \item $\mathcal{R}$ = Recovery rate (\% of par received in default, typically 40\%)
+    \item $dQ(t)$ = Change in survival probability (negative, represents default intensity)
+\end{itemize}
+
+\textbf{Interpretation}:
+\begin{enumerate}
+    \item \textbf{Coupon PV}: Each coupon $c\Delta t$ is discounted by $B(t_i)$ (time value) and $Q(t_i)$ (probability of survival to receive it)
+    \item \textbf{Principal PV}: Par value of 100 discounted to today, received only if issuer survives to maturity
+    \item \textbf{Recovery PV}: If default occurs at time $\tau \in [0,T]$, receive $\mathcal{R} \times 100$. The integral aggregates this across all possible default times weighted by default probability density
+\end{enumerate}
+\end{keybox}
+
+\subsubsection{Survival Probability and Hazard Rate}
+
+\begin{implbox}
+The survival probability $Q(t)$ is defined via the \textbf{hazard rate} $\lambda(t)$:
+
+\begin{equation}
+Q(t) = \exp\left(-\int_0^t \lambda(s)ds\right)
+\end{equation}
+
+\textbf{Hazard Rate $\lambda(t)$}: Instantaneous default intensity at time $t$ (annualized rate).
+
+\textbf{Interpretation}:
+\begin{itemize}
+    \item $\lambda(t) dt$ = probability of default in tiny interval $[t, t+dt]$, given survival to $t$
+    \item Integral $\int_0^t \lambda(s)ds$ = cumulative hazard (expected number of defaults if defaults could repeat)
+    \item $Q(t)$ = probability of \textbf{NO} default in $[0,t]$
+\end{itemize}
+
+\textbf{Properties}:
+\begin{itemize}
+    \item $Q(0) = 1$ (certainty of survival at $t=0$)
+    \item $Q(t)$ is monotonically decreasing
+    \item $Q(t) \to 0$ as $t \to \infty$ (eventual default certain for risky issuer)
+    \item $\lambda(t) > 0$ for all $t$ (hazard rate always positive)
+\end{itemize}
+\end{implbox}
+
+\subsubsection{Parametric Forms for Hazard Rate}
+
+\begin{warnbox}
+\textbf{Critical Choice}: We must choose a functional form for $\lambda(t)$ to fit to data.
+
+\textbf{Trade-off}:
+\begin{itemize}
+    \item \textbf{Too simple} (e.g., constant $\lambda$): Cannot fit upward-sloping or inverted curves
+    \item \textbf{Too complex} (e.g., NSS with 6 parameters): Overfitting, unstable, noisy
+\end{itemize}
+
+\textbf{Recommendation}: Start with \textbf{Exponential Hazard} (3 parameters), upgrade to NSS only if needed.
+\end{warnbox}
+
+\textbf{Option A: Constant Hazard Rate}
+
+\begin{equation}
+\lambda(t) = \lambda_0
+\end{equation}
+
+\begin{equation}
+Q(t) = e^{-\lambda_0 t}
+\end{equation}
+
+\textbf{Parameters}: 1 ($\lambda_0$)
+
+\textbf{Use Case}: Very short-dated curves (<3 years), or high-grade issuers where curve is nearly flat.
+
+\textbf{Limitation}: Cannot model term structure (spread vs maturity relationship).
+
+\vspace{0.5cm}
+
+\textbf{Option B: Exponential Hazard Rate (RECOMMENDED)}
+
+\begin{equation}
+\lambda(t) = \lambda_0 + \lambda_1 e^{-\beta t}
+\end{equation}
+
+\textbf{Integral}:
+\begin{equation}
+\int_0^t \lambda(s)ds = \lambda_0 t + \frac{\lambda_1}{\beta}(1 - e^{-\beta t})
+\end{equation}
+
+\textbf{Survival Probability}:
+\begin{equation}
+Q(t) = \exp\left[-\lambda_0 t - \frac{\lambda_1}{\beta}(1 - e^{-\beta t})\right]
+\end{equation}
+
+\textbf{Parameters}: 3 ($\lambda_0, \lambda_1, \beta$)
+
+\begin{itemize}
+    \item $\lambda_0$: Long-term (floor) hazard rate
+    \item $\lambda_1$: Short-term additional hazard (can be negative for inverted curves)
+    \item $\beta$: Decay rate (controls how quickly $\lambda_1$ effect fades)
+\end{itemize}
+
+\textbf{Behavior}:
+\begin{itemize}
+    \item $t \to 0$: $\lambda(t) \to \lambda_0 + \lambda_1$ (short-term hazard)
+    \item $t \to \infty$: $\lambda(t) \to \lambda_0$ (long-term hazard)
+    \item $\lambda_1 > 0$: Downward-sloping hazard (upward-sloping spread curve)
+    \item $\lambda_1 < 0$: Upward-sloping hazard (inverted spread curve, rare but possible)
+\end{itemize}
+
+\textbf{Constraints}:
+\begin{itemize}
+    \item $\lambda_0 > 0$ (strictly positive long-term hazard)
+    \item $\beta > 0$ (positive decay rate)
+    \item $\lambda_0 + \lambda_1 > 0$ (ensure $\lambda(0) > 0$)
+\end{itemize}
+
+\vspace{0.5cm}
+
+\textbf{Option C: Nelson-Siegel-Svensson (Advanced)}
+
+\begin{equation}
+\lambda(t) = \beta_0 + \beta_1 \frac{1-e^{-t/\tau_1}}{t/\tau_1} + \beta_2\left[\frac{1-e^{-t/\tau_1}}{t/\tau_1} - e^{-t/\tau_1}\right] + \beta_3\left[\frac{1-e^{-t/\tau_2}}{t/\tau_2} - e^{-t/\tau_2}\right]
+\end{equation}
+
+\textbf{Parameters}: 6 ($\beta_0, \beta_1, \beta_2, \beta_3, \tau_1, \tau_2$)
+
+\textbf{Use Case}: Only when exponential form fails to fit (e.g., pronounced hump in curve).
+
+\textbf{Warning}: High risk of overfitting. Use only with many bonds (10+) and regularization.
+
+%=============================================================================
+\subsection{Risky PV01 ($\Pi$): Definition and Calculation}
+%=============================================================================
+
+\begin{keybox}
+\textbf{Risky PV01} (denoted $\Pi(T)$) is the present value of \$1 per year paid continuously from now until maturity $T$, \textbf{conditional on survival}.
+
+\begin{equation}
+\Pi(T) = \int_0^T B(t)Q(t)dt
+\end{equation}
+
+\textbf{Interpretation}:
+\begin{itemize}
+    \item This is the "duration" of a risky cash flow
+    \item It combines time value ($B(t)$) and credit risk ($Q(t)$)
+    \item For a risk-free bond, $Q(t) \equiv 1$, so $\Pi(T) = \int_0^T B(t)dt$ = regular PV01
+    \item For a risky bond, $Q(t) < 1$, so $\Pi(T) <$ regular PV01
+\end{itemize}
+
+\textbf{Why is this central to the framework?}
+\begin{enumerate}
+    \item Appears in par-adjusted spread formula (Section \ref{sec:par_adjusted_spread})
+    \item Needed to convert spread residuals to price residuals
+    \item Essential for carry/rolldown/RV decomposition
+    \item Used in all signal calculations
+\end{enumerate}
+\end{keybox}
+
+\subsubsection{Numerical Calculation of $\Pi(T)$}
+
+\begin{implbox}
+\textbf{Method}: Trapezoid rule on a quarterly grid (most stable, exactly satisfies parity equation).
+
+\textbf{Algorithm}:
+
+\begin{algorithm}[H]
+\caption{Calculate Risky PV01}
+\begin{algorithmic}[1]
+\STATE \textbf{Input}: Maturity $T$, Survival Curve $Q(\cdot)$, Risk-Free Curve $B(\cdot)$
+\STATE \textbf{Output}: Risky PV01 $\Pi(T)$
+\STATE
+\STATE $n \gets \lfloor 4T \rfloor + 1$ \COMMENT{Quarterly grid}
+\STATE $t_0, t_1, \ldots, t_n \gets \text{linspace}(0, T, n+1)$
+\STATE
+\FOR{$i = 0$ \TO $n$}
+    \STATE $B_i \gets B(t_i)$ \COMMENT{Risk-free discount factor}
+    \STATE $Q_i \gets Q(t_i)$ \COMMENT{Survival probability}
+    \STATE $\text{integrand}_i \gets B_i \times Q_i$
+\ENDFOR
+\STATE
+\STATE $\Pi \gets 0$
+\FOR{$i = 1$ \TO $n$}
+    \STATE $\Pi \gets \Pi + \frac{\text{integrand}_{i-1} + \text{integrand}_i}{2} \times (t_i - t_{i-1})$
+\ENDFOR
+\STATE
+\RETURN $\Pi$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Python Implementation}:
+\begin{lstlisting}
+import numpy as np
+
+def calculate_risky_pv01(maturity_years, survival_curve, rf_curve):
+    """
+    Calculate risky PV01 using trapezoid rule.
+    
+    Parameters:
+    -----------
+    maturity_years : float
+        Bond maturity in years
+    survival_curve : SurvivalCurve object
+        Must have .survival_prob(t) method
+    rf_curve : RiskFreeCurve object
+        Must have .discount_factor(t) method
+    
+    Returns:
+    --------
+    risky_pv01 : float
+        Risky PV01 in years
+    """
+    # Quarterly grid
+    n_steps = int(maturity_years * 4) + 1
+    t_grid = np.linspace(0, maturity_years, n_steps)
+    
+    # Compute integrand: B(t) * Q(t)
+    integrand = np.array([
+        rf_curve.discount_factor(t) * survival_curve.survival_prob(t)
+        for t in t_grid
+    ])
+    
+    # Trapezoid rule
+    risky_pv01 = np.trapz(integrand, t_grid)
+    
+    return risky_pv01
+\end{lstlisting}
+
+\textbf{Optimization Note}: For production, implement in Cython or Numba for 10-100x speedup:
+\begin{lstlisting}
+# Cython version (in .pyx file)
+import numpy as np
+cimport numpy as np
+cimport cython
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def calculate_risky_pv01_fast(double maturity_years,
+                                survival_curve,
+                                rf_curve):
+    cdef int n_steps = int(maturity_years * 4) + 1
+    cdef np.ndarray[double] t_grid = np.linspace(0, maturity_years, n_steps)
+    cdef np.ndarray[double] integrand = np.empty(n_steps)
+    cdef int i
+    cdef double risky_pv01 = 0.0
+    
+    # Compute integrand
+    for i in range(n_steps):
+        integrand[i] = (rf_curve.discount_factor(t_grid[i]) * 
+                        survival_curve.survival_prob(t_grid[i]))
+    
+    # Trapezoid rule
+    for i in range(1, n_steps):
+        risky_pv01 += 0.5 * (integrand[i-1] + integrand[i]) * (t_grid[i] - t_grid[i-1])
+    
+    return risky_pv01
+\end{lstlisting}
+\end{implbox}
+
+\subsubsection{Relationship Between $\Pi$ and CR01}
+
+\begin{examplebox}
+\textbf{Question}: I already have CR01 from my risk system. Can I just use that instead of computing $\Pi$?
+
+\textbf{Answer}: \textcolor{warning}{\textbf{NO.}} They are related but distinct.
+
+\textbf{CR01} = Dollar P\&L change for 1bp parallel shift in credit spread
+
+For a bond with price $P$ and notional \$1mm:
+\begin{equation}
+\text{CR01} \approx -\frac{\partial P}{\partial s} \times \$10{,}000 = -10{,}000 \times \frac{\partial P}{\partial s}
+\end{equation}
+
+For bonds near par and moderate spreads:
+\begin{equation}
+\text{CR01} \approx 100 \times \Pi \times \text{NotionalMM}
+\end{equation}
+
+\textbf{Example}:
+\begin{itemize}
+    \item Bond with $T=5$ years, spread $s=200$ bps
+    \item Risk-free curve flat at 3\%
+    \item Recovery $\mathcal{R}=40\%$
+    \item Survival curve gives $\Pi(5) \approx 4.2$ years
+    \item For \$1mm notional: CR01 $\approx 100 \times 4.2 = \$420$
+\end{itemize}
+
+\textbf{Why can't we invert this to get $\Pi$ from CR01?}
+
+\begin{enumerate}
+    \item CR01 calculation may use different spread convention (Z-spread, OAS, ASW)
+    \item CR01 may include convexity adjustments
+    \item CR01 formula: $\text{CR01} = f(P, c, T, s, \ldots)$ — many moving parts
+    \item $\Pi$ formula: $\Pi = \int_0^T B(t)Q(t)dt$ — clean, theory-based
+\end{enumerate}
+
+\textbf{Bottom Line}: \textcolor{implementation}{\textbf{Compute $\Pi$ directly as part of curve fitting. Do not try to back it out from CR01.}}
+\end{examplebox}
+
+%=============================================================================
+\subsection{Expected Loss ($\Xi$) and Recovery}
+%=============================================================================
+
+\begin{keybox}
+\textbf{Expected Loss} (denoted $\Xi(T)$) is the present value of loss in case of default before maturity $T$.
+
+\begin{equation}
+\Xi(T) = \int_0^T B(t)dQ(t)
+\end{equation}
+
+Since $Q(t)$ is decreasing, $dQ(t) < 0$. We can rewrite:
+\begin{equation}
+\Xi(T) = \int_0^T B(t)\lambda(t)Q(t)dt
+\end{equation}
+
+\textbf{Interpretation}:
+\begin{itemize}
+    \item $\lambda(t)Q(t)dt$ = probability density of default at time $t$
+    \item $B(t)$ = PV of \$1 at time $t$
+    \item $\Xi(T)$ = expected PV of \$1 loss (i.e., no recovery)
+\end{itemize}
+
+\textbf{With Recovery}:
+If recovery rate is $\mathcal{R}$ (e.g., 40\%), then expected loss is:
+\begin{equation}
+\text{Expected Loss with Recovery} = (1 - \mathcal{R}) \Xi(T)
+\end{equation}
+
+This appears in the bond pricing formula (Section \ref{sec:bond_pricing}).
+\end{keybox}
+
+\subsubsection{Numerical Calculation of $\Xi(T)$}
+
+\begin{implbox}
+\textbf{Method}: Trapezoid rule using survival probability differences.
+
+\textbf{Algorithm}:
+
+\begin{algorithm}[H]
+\caption{Calculate Expected Loss}
+\begin{algorithmic}[1]
+\STATE \textbf{Input}: Maturity $T$, Survival Curve $Q(\cdot)$, Risk-Free Curve $B(\cdot)$
+\STATE \textbf{Output}: Expected Loss $\Xi(T)$
+\STATE
+\STATE $n \gets \lfloor 4T \rfloor + 1$
+\STATE $t_0, t_1, \ldots, t_n \gets \text{linspace}(0, T, n+1)$
+\STATE
+\FOR{$i = 0$ \TO $n$}
+    \STATE $B_i \gets B(t_i)$
+    \STATE $Q_i \gets Q(t_i)$
+\ENDFOR
+\STATE
+\STATE $\Xi \gets 0$
+\FOR{$i = 1$ \TO $n$}
+    \STATE $B_{\text{mid}} \gets (B_{i-1} + B_i) / 2$ \COMMENT{Midpoint discount}
+    \STATE $dQ \gets Q_{i-1} - Q_i$ \COMMENT{Positive (Q decreasing)}
+    \STATE $\Xi \gets \Xi + B_{\text{mid}} \times dQ$
+\ENDFOR
+\STATE
+\RETURN $\Xi$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Python Implementation}:
+\begin{lstlisting}
+def calculate_expected_loss(maturity_years, survival_curve, rf_curve):
+    """
+    Calculate expected loss using trapezoid rule.
+    
+    Returns:
+    --------
+    expected_loss : float
+        Expected loss (no recovery)
+    """
+    n_steps = int(maturity_years * 4) + 1
+    t_grid = np.linspace(0, maturity_years, n_steps)
+    
+    B = np.array([rf_curve.discount_factor(t) for t in t_grid])
+    Q = np.array([survival_curve.survival_prob(t) for t in t_grid])
+    
+    # Midpoint discount factors
+    B_mid = (B[:-1] + B[1:]) / 2
+    
+    # Q differences (positive because Q decreases)
+    dQ = Q[:-1] - Q[1:]
+    
+    expected_loss = np.sum(B_mid * dQ)
+    
+    return expected_loss
+\end{lstlisting}
+\end{implbox}
+
+%=============================================================================
+\subsection{Par-Adjusted Spread: The Core Innovation}
+\label{sec:par_adjusted_spread}
+%=============================================================================
+
+\begin{keybox}
+The \textbf{par-adjusted spread} $s$ is a spread measure that correctly handles non-par bonds by accounting for:
+\begin{enumerate}
+    \item The bond's coupon $c$
+    \item The funding/forward rate $r_b(T)$
+    \item The deviation from par $(P/100 - 1)$
+    \item The risky duration $\Pi(T)$
+\end{enumerate}
+
+\begin{equation}
+\boxed{s = c - r_b(T) - \frac{P/100 - 1}{\Pi(T)}}
+\end{equation}
+
+\textbf{Key Properties}:
+\begin{itemize}
+    \item \textbf{Coupon-neutral}: High/low coupon bonds with same credit risk have same $s$
+    \item \textbf{Comparable}: Can directly compare $s$ across bonds of different coupons/maturities
+    \item \textbf{CDS-compatible}: Basis = $s_{\text{bond}} - s_{\text{CDS}}$ is meaningful
+\end{itemize}
+\end{keybox}
+
+\subsubsection{Risky-Weighted Forward Rate $r_b(T)$}
+
+\begin{implbox}
+The risky-weighted forward rate is:
+
+\begin{equation}
+r_b(T) = \frac{\int_0^T f(t)B(t)Q(t)dt}{\int_0^T B(t)Q(t)dt}
+\end{equation}
+
+Where $f(t) = -\frac{B'(t)}{B(t)}$ is the instantaneous risk-free forward rate.
+
+\textbf{Intuition}:
+\begin{itemize}
+    \item This is the \textbf{average} risk-free forward rate
+    \item Weighted by risky discount factor $B(t)Q(t)$
+    \item More weight on short dates (high $Q(t)$), less on long dates (low $Q(t)$)
+\end{itemize}
+
+\textbf{Special Cases}:
+\begin{itemize}
+    \item If risk-free curve is flat: $f(t) = r$ (constant), then $r_b(T) = r$
+    \item If $Q(t) \equiv 1$ (risk-free): $r_b(T) = $ regular par rate
+\end{itemize}
+
+\textbf{Numerical Calculation}:
+\begin{lstlisting}
+def calculate_risky_weighted_forward(maturity_years, 
+                                      survival_curve, 
+                                      rf_curve):
+    """
+    Calculate risky-weighted average forward rate.
+    """
+    n_steps = int(maturity_years * 4) + 1
+    t_grid = np.linspace(0, maturity_years, n_steps)
+    
+    # Forward rates
+    f = np.array([rf_curve.forward_rate(t) for t in t_grid])
+    
+    # B(t) * Q(t)
+    BQ = np.array([
+        rf_curve.discount_factor(t) * survival_curve.survival_prob(t)
+        for t in t_grid
+    ])
+    
+    # Numerator: integral of f(t) * B(t) * Q(t)
+    numerator = np.trapz(f * BQ, t_grid)
+    
+    # Denominator: integral of B(t) * Q(t) = Pi(T)
+    denominator = np.trapz(BQ, t_grid)
+    
+    r_b = numerator / denominator
+    
+    return r_b
+\end{lstlisting}
+\end{implbox}
+
+\subsubsection{Complete Par-Adjusted Spread Calculation}
+
+\begin{implbox}
+\textbf{Full Procedure}:
+
+\begin{algorithm}[H]
+\caption{Calculate Par-Adjusted Spread}
+\begin{algorithmic}[1]
+\STATE \textbf{Input}: Bond (price $P$, coupon $c$, maturity $T$), Survival Curve, RF Curve
+\STATE \textbf{Output}: Par-adjusted spread $s$ (in bps)
+\STATE
+\STATE $\Pi \gets \text{calculate\_risky\_pv01}(T, \text{survival\_curve}, \text{rf\_curve})$
+\STATE $r_b \gets \text{calculate\_risky\_weighted\_forward}(T, \text{survival\_curve}, \text{rf\_curve})$
+\STATE
+\STATE $s \gets c - r_b - \frac{P/100 - 1}{\Pi}$
+\STATE
+\RETURN $s$ (convert to bps by multiplying by 10,000 if needed)
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Python Implementation}:
+\begin{lstlisting}
+def calculate_par_adjusted_spread(bond, survival_curve, rf_curve):
+    """
+    Calculate par-adjusted spread for a bond.
+    
+    Parameters:
+    -----------
+    bond : Bond object
+        Must have .price, .coupon, .years_to_maturity
+    survival_curve : SurvivalCurve
+    rf_curve : RiskFreeCurve
+    
+    Returns:
+    --------
+    par_adjusted_spread : float
+        Spread in bps
+    """
+    T = bond.years_to_maturity
+    P = bond.price  # Clean price (% of par)
+    c = bond.coupon  # Annual coupon (%)
+    
+    # Calculate risky PV01
+    Pi = calculate_risky_pv01(T, survival_curve, rf_curve)
+    
+    # Calculate risky-weighted forward rate
+    r_b = calculate_risky_weighted_forward(T, survival_curve, rf_curve)
+    
+    # Par-adjusted spread (as decimal, e.g., 0.02 for 200bps)
+    s = c - r_b - (P / 100 - 1) / Pi
+    
+    # Convert to bps
+    s_bps = s * 10000
+    
+    return s_bps
+\end{lstlisting}
+\end{implbox}
+
+\subsubsection{Parity Equation (Sanity Check)}
+
+\begin{warnbox}
+\textbf{The Parity Equation} must always hold (up to numerical precision):
+
+\begin{equation}
+B(T)Q(T) + \Xi(T) + r_b(T)\Pi(T) = 1
+\end{equation}
+
+\textbf{Use This to Validate Your Calculations}:
+\begin{lstlisting}
+def validate_parity_equation(T, survival_curve, rf_curve, tolerance=1e-6):
+    """
+    Check if parity equation holds.
+    Returns True if valid, raises error otherwise.
+    """
+    B_T = rf_curve.discount_factor(T)
+    Q_T = survival_curve.survival_prob(T)
+    Xi = calculate_expected_loss(T, survival_curve, rf_curve)
+    r_b = calculate_risky_weighted_forward(T, survival_curve, rf_curve)
+    Pi = calculate_risky_pv01(T, survival_curve, rf_curve)
+    
+    lhs = B_T * Q_T + Xi + r_b * Pi
+    
+    error = abs(lhs - 1.0)
+    
+    if error > tolerance:
+        raise ValueError(f"Parity equation violated! LHS = {lhs}, error = {error}")
+    
+    return True
+\end{lstlisting}
+
+\textbf{Why This Matters}:
+\begin{itemize}
+    \item If parity holds $\Rightarrow$ your numerical integration is correct
+    \item If parity fails $\Rightarrow$ bug in $\Pi$, $\Xi$, or $r_b$ calculation
+\end{itemize}
+\end{warnbox}
+
+%=============================================================================
+\subsection{Curve Fitting: Detailed Optimization Procedure}
+%=============================================================================
+
+\begin{keybox}
+\textbf{Objective}: Find parameters $\theta$ of hazard rate function $\lambda(t; \theta)$ that minimize pricing errors across all bonds.
+
+\textbf{Optimization Problem}:
+\begin{equation}
+\min_{\theta} \sum_{j=1}^{M} w_j \left[\Delta P_j(\theta)\right]^2
+\end{equation}
+
+Where:
+\begin{itemize}
+    \item $\Delta P_j = P_j^{\text{model}}(\theta) - P_j^{\text{market}}$ (price residual)
+    \item $w_j$ = weight for bond $j$ (based on liquidity, bid-ask spread)
+    \item $M$ = number of bonds
+\end{itemize}
+\end{keybox}
+
+\subsubsection{Step-by-Step Fitting Procedure}
+
+\begin{implbox}
+\textbf{STEP 1: Data Preparation}
+
+For issuer or sector-rating, collect all bonds:
+\begin{lstlisting}
+def prepare_bonds_for_fitting(issuer_id, as_of_date, min_price=50):
+    """
+    Get all bonds for issuer, filter, validate.
+    """
+    bonds = get_bonds(issuer_id=issuer_id, as_of_date=as_of_date)
+    
+    # Filter criteria
+    bonds_filtered = []
+    for bond in bonds:
+        # Skip bonds with missing data
+        if bond.price is None or bond.coupon is None:
+            continue
+        
+        # Skip very distressed (price < 50)
+        if bond.price < min_price:
+            continue
+        
+        # Skip very short-dated (< 3 months)
+        if bond.years_to_maturity < 0.25:
+            continue
+        
+        # Skip callable/puttable (for now)
+        if bond.is_callable or bond.is_putable:
+            continue
+        
+        bonds_filtered.append(bond)
+    
+    if len(bonds_filtered) < 3:
+        raise ValueError(f"Insufficient bonds for {issuer_id}: {len(bonds_filtered)}")
+    
+    return bonds_filtered
+\end{lstlisting}
+
+\textbf{STEP 2: Initial Parameter Guess}
+
+For exponential hazard model ($\lambda_0, \lambda_1, \beta$):
+\begin{lstlisting}
+def initial_guess_exponential(bonds):
+    """
+    Heuristic for initial parameters.
+    """
+    # Use longest-maturity bond to estimate lambda_0
+    long_bond = max(bonds, key=lambda b: b.years_to_maturity)
+    
+    # Rough estimate: assume PD ~ (100 - P) / 100
+    implied_pd = (100 - long_bond.price) / 100
+    implied_pd = max(0.01, min(0.99, implied_pd))  # Clip to [0.01, 0.99]
+    
+    # Solve: Q(T) = exp(-lambda_0 * T) = 1 - PD
+    # => lambda_0 = -log(1 - PD) / T
+    lambda_0 = -np.log(1 - implied_pd) / long_bond.years_to_maturity
+    
+    # Assume short-term spread is 50% higher than long-term
+    lambda_1 = 0.5 * lambda_0
+    
+    # Assume half-life of 2 years for lambda_1 decay
+    beta = np.log(2) / 2.0
+    
+    return np.array([lambda_0, lambda_1, beta])
+\end{lstlisting}
+
+\textbf{STEP 3: Define Bounds}
+
+\begin{lstlisting}
+def get_parameter_bounds_exponential():
+    """
+    Bounds for [lambda_0, lambda_1, beta].
+    """
+    bounds_lower = [
+        1e-5,   # lambda_0 > 0 (tiny floor)
+        -1.0,   # lambda_1 can be negative (inverted curves)
+        0.01    # beta > 0 (positive decay)
+    ]
+    
+    bounds_upper = [
+        0.5,    # lambda_0 < 50% (sanity check)
+        1.0,    # lambda_1 < 100%
+        10.0    # beta < 10 (fast decay cap)
+    ]
+    
+    return (bounds_lower, bounds_upper)
+\end{lstlisting}
+
+\textbf{STEP 4: Objective Function}
+
+\begin{lstlisting}
+def objective_function(params, bonds, rf_curve, recovery):
+    """
+    Compute price residuals for given parameters.
+    
+    Parameters:
+    -----------
+    params : np.ndarray
+        [lambda_0, lambda_1, beta]
+    bonds : list of Bond
+    rf_curve : RiskFreeCurve
+    recovery : float
+    
+    Returns:
+    --------
+    residuals : np.ndarray
+        Price residuals (model - market)
+    """
+    lambda_0, lambda_1, beta = params
+    
+    # Create temporary survival curve
+    temp_curve = ExponentialSurvivalCurve(
+        lambda_0=lambda_0,
+        lambda_1=lambda_1,
+        beta=beta,
+        recovery=recovery
+    )
+    
+    residuals = []
+    for bond in bonds:
+        # Calculate model price
+        P_model = calculate_bond_price(
+            bond=bond,
+            survival_curve=temp_curve,
+            rf_curve=rf_curve
+        )
+        
+        # Residual: model - market
+        residual = P_model - bond.price
+        
+        # Weight by inverse of bid-ask spread (liquidity)
+        weight = 1.0 / (bond.bid_ask_spread + 0.1)  # +0.1 to avoid div by zero
+        weighted_residual = weight * residual
+        
+        residuals.append(weighted_residual)
+    
+    return np.array(residuals)
+\end{lstlisting}
+
+\textbf{STEP 5: Run Optimization}
+
+\begin{lstlisting}
+from scipy.optimize import least_squares
+
+def fit_survival_curve(bonds, rf_curve, recovery=0.40):
+    """
+    Fit exponential hazard curve to bonds.
+    """
+    # Initial guess
+    x0 = initial_guess_exponential(bonds)
+    
+    # Bounds
+    bounds = get_parameter_bounds_exponential()
+    
+    # Optimize using Trust Region Reflective
+    result = least_squares(
+        fun=objective_function,
+        x0=x0,
+        args=(bonds, rf_curve, recovery),
+        bounds=bounds,
+        method='trf',           # Trust-region-reflective
+        ftol=1e-8,              # Function tolerance
+        xtol=1e-8,              # Parameter tolerance
+        gtol=1e-8,              # Gradient tolerance
+        max_nfev=200,           # Max function evaluations
+        verbose=2               # Print progress
+    )
+    
+    if not result.success:
+        print(f"Warning: Optimization failed. Message: {result.message}")
+    
+    # Extract fitted parameters
+    lambda_0, lambda_1, beta = result.x
+    
+    # Calculate fit quality metrics
+    residuals = result.fun
+    rmse = np.sqrt(np.mean(residuals**2))
+    max_residual = np.max(np.abs(residuals))
+    
+    # Create final curve object
+    survival_curve = ExponentialSurvivalCurve(
+        lambda_0=lambda_0,
+        lambda_1=lambda_1,
+        beta=beta,
+        recovery=recovery
+    )
+    
+    fit_result = {
+        'survival_curve': survival_curve,
+        'residuals': residuals,
+        'rmse': rmse,
+        'max_residual': max_residual,
+        'n_iterations': result.nfev,
+        'success': result.success
+    }
+    
+    return fit_result
+\end{lstlisting}
+\end{implbox}
+
+\subsubsection{Bond Pricing Function (Used in Optimization)}
+
+\begin{implbox}
+\begin{lstlisting}
+def calculate_bond_price(bond, survival_curve, rf_curve):
+    """
+    Calculate model price of bond using survival curve.
+    
+    Formula:
+    P/100 = sum(c * B(t_i) * Q(t_i) * dt) + 100 * B(T) * Q(T) + R * Xi(T)
+    """
+    T = bond.years_to_maturity
+    c = bond.coupon
+    R = survival_curve.recovery
+    
+    # === COUPON PV ===
+    # Quarterly coupon dates
+    n_coupons = int(T * 4)
+    if n_coupons == 0:
+        coupon_dates = []
+    else:
+        coupon_dates = np.linspace(0.25, T, n_coupons)
+    
+    coupon_pv = 0.0
+    for t in coupon_dates:
+        B_t = rf_curve.discount_factor(t)
+        Q_t = survival_curve.survival_prob(t)
+        coupon_pv += (c / 4) * B_t * Q_t  # Quarterly coupon payment
+    
+    # === PRINCIPAL PV ===
+    B_T = rf_curve.discount_factor(T)
+    Q_T = survival_curve.survival_prob(T)
+    principal_pv = 100 * B_T * Q_T
+    
+    # === RECOVERY PV ===
+    Xi = calculate_expected_loss(T, survival_curve, rf_curve)
+    recovery_pv = R * Xi
+    
+    # === TOTAL PRICE ===
+    price = coupon_pv + principal_pv + recovery_pv
+    
+    return price
+\end{lstlisting}
+
+\textbf{Critical Note}: This function is called \textbf{hundreds of times} during optimization (once per bond per iteration). Optimize aggressively using Cython or cache intermediate results.
+\end{implbox}
+
+\subsubsection{Handling Edge Cases}
+
+\begin{warnbox}
+\textbf{Common Problems and Solutions}:
+
+\textbf{Problem 1: Optimization diverges (RMSE $\to \infty$)}
+
+\textbf{Causes}:
+\begin{itemize}
+    \item Initial guess too far from optimum
+    \item Bounds too restrictive
+    \item Data quality issues (bad prices)
+\end{itemize}
+
+\textbf{Solutions}:
+\begin{lstlisting}
+# Try multiple initial guesses
+initial_guesses = [
+    initial_guess_exponential(bonds),           # Heuristic
+    np.array([0.02, 0.01, 1.0]),                # Conservative
+    np.array([0.05, 0.05, 0.5]),                # Aggressive
+]
+
+best_result = None
+best_rmse = np.inf
+
+for x0 in initial_guesses:
+    result = least_squares(...)
+    if result.success and result.rmse < best_rmse:
+        best_result = result
+        best_rmse = result.rmse
+\end{lstlisting}
+
+\textbf{Problem 2: Fitted curve crosses itself or has negative hazard}
+
+\textbf{Cause}: Parameters violate constraints.
+
+\textbf{Solution}: Add constraint checking:
+\begin{lstlisting}
+def validate_parameters(params):
+    """Check if parameters give valid hazard rate."""
+    lambda_0, lambda_1, beta = params
+    
+    # Check lambda(t) > 0 for t in [0, T_max]
+    t_grid = np.linspace(0, 30, 100)
+    for t in t_grid:
+        lambda_t = lambda_0 + lambda_1 * np.exp(-beta * t)
+        if lambda_t <= 0:
+            return False
+    
+    return True
+\end{lstlisting}
+
+\textbf{Problem 3: RMSE acceptable but one bond has huge residual}
+
+\textbf{Cause}: Outlier bond (stale price, special situation).
+
+\textbf{Solution}: Use robust optimization (Huber loss instead of squared loss):
+\begin{lstlisting}
+from scipy.optimize import least_squares
+
+result = least_squares(
+    fun=objective_function,
+    x0=x0,
+    bounds=bounds,
+    loss='huber',  # Robust to outliers
+    f_scale=1.0,   # Huber parameter
+    ...
+)
+\end{lstlisting}
+\end{warnbox}
+
+%=============================================================================
+\subsection{Spread Residuals and Relative Value Signals}
+%=============================================================================
+
+\subsubsection{Computing Spread Residuals}
+
+\begin{keybox}
+Once curve is fitted, compute spread residual for each bond:
+
+\textbf{Step 1}: Calculate par-adjusted spread $s$ (Section \ref{sec:par_adjusted_spread})
+
+\textbf{Step 2}: Calculate par spread from fitted curve:
+\begin{equation}
+s_b(T) = \frac{(1 - \mathcal{R})\Xi(T)}{\Pi(T)}
+\end{equation}
+
+\textbf{Step 3}: Spread residual:
+\begin{equation}
+\Delta s = s - s_b(T)
+\end{equation}
+
+\textbf{Step 4}: Convert to price residual:
+\begin{equation}
+\Delta P = \Delta s \times \Pi(T) \times 100
+\end{equation}
+
+\textbf{Interpretation}:
+\begin{itemize}
+    \item $\Delta s > 0$: Bond is \textbf{cheap} (spread wider than curve $\Rightarrow$ price lower)
+    \item $\Delta s < 0$: Bond is \textbf{rich} (spread tighter than curve $\Rightarrow$ price higher)
+    \item $|\Delta s| < 5$ bps: Roughly fair value
+\end{itemize}
+\end{keybox}
+
+\begin{implbox}
+\begin{lstlisting}
+def calculate_spread_residual(bond, fitted_curve, rf_curve):
+    """
+    Calculate spread residual: actual - fitted.
+    """
+    T = bond.years_to_maturity
+    
+    # === ACTUAL SPREAD ===
+    s_actual = calculate_par_adjusted_spread(bond, fitted_curve, rf_curve)
+    
+    # === FITTED SPREAD ===
+    # Par CDS spread from fitted curve
+    Pi = calculate_risky_pv01(T, fitted_curve, rf_curve)
+    Xi = calculate_expected_loss(T, fitted_curve, rf_curve)
+    R = fitted_curve.recovery
+    
+    s_fitted = (1 - R) * Xi / Pi
+    s_fitted_bps = s_fitted * 10000
+    
+    # === RESIDUAL ===
+    spread_residual_bps = s_actual - s_fitted_bps
+    
+    # === PRICE RESIDUAL ===
+    price_residual = spread_residual_bps / 10000 * Pi * 100
+    
+    return {
+        's_actual': s_actual,
+        's_fitted': s_fitted_bps,
+        'spread_residual': spread_residual_bps,
+        'price_residual': price_residual
+    }
+\end{lstlisting}
+\end{implbox}
+
+\subsubsection{Statistical Normalization (Z-Score)}
+
+\begin{implbox}
+\textbf{Problem}: Spread residual of 10 bps means different things for different bonds:
+\begin{itemize}
+    \item IG bond (typical residual $\pm 5$ bps): 10 bps is \textbf{large}
+    \item HY bond (typical residual $\pm 50$ bps): 10 bps is \textbf{small}
+\end{itemize}
+
+\textbf{Solution}: Normalize using historical standard deviation (z-score).
+
+\begin{lstlisting}
+def calculate_spread_residual_zscore(bond, spread_residual, lookback_days=252):
+    """
+    Normalize spread residual by historical volatility.
+    """
+    # Get historical spread residuals for this bond
+    historical_residuals = get_historical_residuals(
+        bond.isin,
+        lookback_days=lookback_days
+    )
+    
+    if len(historical_residuals) < 20:
+        # Insufficient history, use universe median std
+        std_residual = get_median_std_residual_for_rating(bond.rating)
+    else:
+        mean_residual = historical_residuals.mean()
+        std_residual = historical_residuals.std()
+    
+    if std_residual == 0:
+        zscore = 0.0
+    else:
+        zscore = (spread_residual - mean_residual) / std_residual
+    
+    return zscore
+\end{lstlisting}
+
+\textbf{Interpretation}:
+\begin{itemize}
+    \item $|z| < 1$: Within $\pm 1\sigma$, normal variation
+    \item $|z| \in [1, 2]$: Moderate mispricing
+    \item $|z| > 2$: Significant mispricing (or data error / credit event)
+\end{itemize}
+\end{implbox}
+
+%=============================================================================
+\subsection{Signal Generation: Curve Trading Strategy}
+%=============================================================================
+
+\begin{keybox}
+\textbf{Strategy}: Trade bonds that are rich/cheap relative to fitted issuer curve.
+
+\textbf{Logic}:
+\begin{itemize}
+    \item \textbf{Long} bonds with $z < -1.5$ (cheap)
+    \item \textbf{Short} bonds with $z > +1.5$ (rich)
+    \item Expected return: $\approx 50\%$ of spread residual over 1 month
+\end{itemize}
+\end{keybox}
+
+\begin{implbox}
+\begin{lstlisting}
+def generate_curve_trading_signal(bond, spread_residual, zscore, threshold=1.5):
+    """
+    Generate long/short signal based on spread residual.
+    """
+    from scipy.stats import norm
+    
+    if zscore > threshold:
+        # RICH: Bond expensive
+        direction = 'SHORT'
+        strength = min(100, abs(zscore) * 20)  # Cap at 100
+        confidence = norm.cdf(abs(zscore)) - 0.5  # Tail probability
+        expected_return_bps = -spread_residual * 0.5  # 50% mean reversion
+        
+    elif zscore < -threshold:
+        # CHEAP: Bond cheap
+        direction = 'LONG'
+        strength = min(100, abs(zscore) * 20)
+        confidence = norm.cdf(abs(zscore)) - 0.5
+        expected_return_bps = spread_residual * 0.5
+        
+    else:
+        # FAIR VALUE: No signal
+        return None
+    
+    signal = {
+        'bond_id': bond.isin,
+        'signal_type': 'CURVE_TRADING',
+        'direction': direction,
+        'strength': strength,
+        'confidence': confidence,
+        'spread_residual_bps': spread_residual,
+        'zscore': zscore,
+        'expected_return_bps': expected_return_bps,
+        'horizon_days': 30
+    }
+    
+    return signal
+\end{lstlisting}
+
+\textbf{Risk Management}:
+\begin{itemize}
+    \item \textbf{Position sizing}: Scale by confidence $\times$ strength
+    \item \textbf{Stop loss}: If $|z|$ increases by 1 after entry, cut position 50\%
+    \item \textbf{Fundamental filter}: Exclude if credit analyst flags deterioration
+\end{itemize}
+\end{implbox}
+
+%=============================================================================
+\section{PART II: CDS-EXTENDED FRAMEWORK}
+%=============================================================================
+
+\subsection{CDS Data Integration}
+
+\begin{keybox}
+\textbf{When CDS data is available}, the framework is enhanced in three ways:
+
+\begin{enumerate}
+    \item \textbf{Joint curve fitting}: Fit survival curve to BOTH bond prices AND CDS spreads simultaneously
+    \item \textbf{Basis trading}: Exploit bond-CDS basis mispricings
+    \item \textbf{CDS curve trading}: Generate signals from CDS spread residuals
+\end{enumerate}
+\end{keybox}
+
+\subsubsection{CDS Quote Structure}
+
+\begin{implbox}
+\textbf{Post-2009 CDS Convention}:
+
+CDS quotes have two components:
+\begin{enumerate}
+    \item \textbf{Fixed coupon} $c$: 100 bps (IG) or 500 bps (HY)
+    \item \textbf{Upfront payment} $u$: Paid at inception (\% of notional)
+\end{enumerate}
+
+\textbf{Example CDS Quote}:
+\begin{verbatim}
+AAPL 5Y CDS: 100 bps running, -2.5% upfront
+\end{verbatim}
+
+Interpretation:
+\begin{itemize}
+    \item Protection buyer pays 100 bps/year (quarterly)
+    \item Protection buyer \textbf{receives} 2.5\% upfront (negative upfront $\Rightarrow$ receive)
+    \item This implies AAPL credit is very strong (spread < 100 bps)
+\end{itemize}
+
+\textbf{Conversion to Par Spread}:
+
+Par spread $s_e$ is the running spread that makes upfront = 0.
+
+\begin{equation}
+u = (s_e - c) \tilde{\Pi}(T)
+\end{equation}
+
+Where $\tilde{\Pi}(T)$ is ISDA standard RPV01 (computed with flat hazard curve from $s_e$).
+
+Rearranging:
+\begin{equation}
+s_e = c + \frac{u}{\tilde{\Pi}(T)}
+\end{equation}
+
+\textbf{Implementation}:
+\begin{lstlisting}
+def convert_upfront_to_par_spread(upfront_pct, fixed_coupon_bps, 
+                                   maturity_years, recovery=0.40):
+    """
+    Convert CDS quote (upfront + fixed coupon) to par spread.
+    
+    Uses ISDA flat-hazard-curve convention.
+    """
+    from isda_cds_model import calculate_isda_rpv01  # Hypothetical library
+    
+    # Initial guess for par spread
+    s_e = fixed_coupon_bps + upfront_pct / maturity_years * 10000
+    
+    # Iterative solve: find s_e such that upfront matches
+    for iteration in range(10):
+        # Calculate ISDA RPV01 at current s_e
+        Pi_tilde = calculate_isda_rpv01(s_e / 10000, maturity_years, recovery)
+        
+        # Implied par spread
+        s_e_new = fixed_coupon_bps + (upfront_pct / 100) / Pi_tilde * 10000
+        
+        # Check convergence
+        if abs(s_e_new - s_e) < 0.1:
+            break
+        
+        s_e = s_e_new
+    
+    return s_e
+\end{lstlisting}
+\end{implbox}
+
+\subsubsection{Joint Bond + CDS Curve Fitting}
+
+\begin{warnbox}
+\textbf{Key Idea}: CDS quotes provide \textbf{clean credit view} (no coupon, funding, liquidity effects).
+
+By fitting to both bond prices AND CDS spreads, we get:
+\begin{itemize}
+    \item More accurate curve (anchored by liquid CDS at 5Y, 10Y)
+    \item Better spread residuals for bonds
+    \item Ability to compute bond-CDS basis
+\end{itemize}
+\end{warnbox}
+
+\begin{implbox}
+\textbf{Modified Objective Function}:
+
+\begin{equation}
+\min_{\theta} \underbrace{\sum_{j \in \text{bonds}} w_j^B (\Delta P_j)^2}_{\text{Bond price errors}} + \underbrace{\sum_{k \in \text{CDS}} w_k^{CDS} (\Delta s_k)^2}_{\text{CDS spread errors}}
+\end{equation}
+
+Where:
+\begin{itemize}
+    \item $\Delta P_j$ = bond price residual (points)
+    \item $\Delta s_k$ = CDS spread residual (bps)
+    \item $w_j^B, w_k^{CDS}$ = weights (higher for liquid instruments)
+\end{itemize}
+
+\textbf{Weight Selection}:
+\begin{lstlisting}
+def calculate_weights(bonds, cds_quotes):
+    """
+    Assign weights based on liquidity.
+    """
+    bond_weights = []
+    for bond in bonds:
+        # Weight = 1 / (bid-ask spread + floor)
+        ba_spread = bond.ask - bond.bid if bond.ask and bond.bid else 0.5
+        weight = 1.0 / (ba_spread + 0.1)
+        bond_weights.append(weight)
+    
+    cds_weights = []
+    for cds in cds_quotes:
+        # CDS typically more liquid than bonds
+        # Give higher relative weight
+        ba_spread_cds = cds.ask_spread - cds.bid_spread
+        weight = 100.0 / (ba_spread_cds + 1.0)  # Factor of 100 for units (bps vs points)
+        cds_weights.append(weight)
+    
+    return bond_weights, cds_weights
+\end{lstlisting}
+
+\textbf{Modified Objective Function Implementation}:
+\begin{lstlisting}
+def objective_function_with_cds(params, bonds, cds_quotes, rf_curve, recovery):
+    """
+    Residuals for both bonds and CDS.
+    """
+    lambda_0, lambda_1, beta = params
+    
+    temp_curve = ExponentialSurvivalCurve(lambda_0, lambda_1, beta, recovery)
+    
+    residuals = []
+    
+    # === BOND RESIDUALS ===
+    for bond, weight in zip(bonds, bond_weights):
+        P_model = calculate_bond_price(bond, temp_curve, rf_curve)
+        residual = weight * (P_model - bond.price)
+        residuals.append(residual)
+    
+    # === CDS RESIDUALS ===
+    for cds, weight in zip(cds_quotes, cds_weights):
+        # Calculate model par CDS spread
+        T = cds.maturity
+        Pi = calculate_risky_pv01(T, temp_curve, rf_curve)
+        Xi = calculate_expected_loss(T, temp_curve, rf_curve)
+        s_model = (1 - recovery) * Xi / Pi * 10000  # bps
+        
+        # Residual
+        residual = weight * (s_model - cds.spread)
+        residuals.append(residual)
+    
+    return np.array(residuals)
+\end{lstlisting}
+\end{implbox}
+
+\subsubsection{Bond-CDS Basis}
+
+\begin{keybox}
+\textbf{Definition}:
+\begin{equation}
+\text{Basis} = s_{\text{bond}} - s_{\text{CDS}}
+\end{equation}
+
+Where both spreads are par-adjusted.
+
+\textbf{Theoretical Value}: Basis = 0 (no-arbitrage)
+
+\textbf{Empirical Reality}: Basis $\ne 0$ due to:
+\begin{enumerate}
+    \item \textbf{Funding costs}: Bond requires upfront capital, CDS does not
+    \item \textbf{Liquidity premium}: Bonds less liquid $\Rightarrow$ wider spread
+    \item \textbf{Cheapest-to-deliver option}: CDS can deliver any bond
+    \item \textbf{Regulatory capital}: Different risk weights
+    \item \textbf{Counterparty risk}: CDS has bilateral credit risk
+\end{enumerate}
+
+\textbf{Typical Range}:
+\begin{itemize}
+    \item Pre-2008: Basis $\approx -10$ to $-20$ bps (bonds tight to CDS)
+    \item 2008-09 Crisis: Basis $\approx +200$ to $+500$ bps (funding stress)
+    \item Post-2010: Basis $\approx +20$ to $+50$ bps (new normal)
+\end{itemize}
+\end{keybox}
+
+\begin{implbox}
+\begin{lstlisting}
+def calculate_bond_cds_basis(bond, cds_spread, fitted_curve, rf_curve):
+    """
+    Calculate basis between bond and CDS.
+    """
+    # Bond par-adjusted spread
+    s_bond = calculate_par_adjusted_spread(bond, fitted_curve, rf_curve)
+    
+    # CDS spread (already in bps)
+    s_cds = cds_spread
+    
+    # Basis
+    basis = s_bond - s_cds
+    
+    # Historical context
+    historical_basis = get_historical_basis(bond.issuer_id, lookback_days=252)
+    
+    basis_percentile = (basis > historical_basis).mean()
+    basis_zscore = (basis - historical_basis.mean()) / historical_basis.std()
+    
+    return {
+        'basis_bps': basis,
+        'basis_percentile': basis_percentile,
+        'basis_zscore': basis_zscore
+    }
+\end{lstlisting}
+\end{implbox}
+
+%=============================================================================
+\subsection{Issuer vs Sector Curves: The Complete Strategy}
+%=============================================================================
+
+\begin{keybox}
+\textbf{Critical Decision}: You will build TWO types of curves in parallel:
+
+\begin{enumerate}
+    \item \textbf{Issuer-specific curves}: For large issuers with many bonds (3+)
+    \item \textbf{Sector-rating curves}: For small issuers with few bonds (1-2)
+\end{enumerate}
+
+\textbf{Why both?}
+\begin{itemize}
+    \item Cannot fit unique curve with only 1 bond (underdetermined system)
+    \item But can aggregate similar bonds across issuers into sector buckets
+    \item Get best of both: precision where possible, coverage everywhere
+\end{itemize}
+\end{keybox}
+
+\subsubsection{The Mathematical Problem with One Bond}
+
+\begin{warnbox}
+\textbf{Fundamental Issue}: 1 equation, 3 unknowns = infinite solutions.
+
+\textbf{Example - Apple with only one bond:}
+
+Bond: 5Y maturity, 4\% coupon, Price = 98.5
+
+We need to find: $\theta = [\lambda_0, \lambda_1, \beta]$
+
+But we only have:
+$$P_{\text{model}}(\lambda_0, \lambda_1, \beta) = 98.5$$
+
+\textbf{Infinite valid solutions:}
+
+\begin{tabular}{cccccc}
+\toprule
+Curve & $\lambda_0$ & $\lambda_1$ & $\beta$ & Q(5Y) & Model Price \\
+\midrule
+A & 0.010 & 0.000 & 0.5 & 0.951 & 98.5 \\
+B & 0.005 & 0.005 & 0.5 & 0.951 & 98.5 \\
+C & 0.002 & 0.008 & 1.0 & 0.951 & 98.5 \\
+D & 0.015 & -0.005 & 0.3 & 0.951 & 98.5 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.3cm}
+
+\textbf{All four curves}:
+\begin{itemize}
+    \item Fit the 5Y bond perfectly ✓
+    \item Give wildly different predictions for other maturities ✗
+    \item Are equally "valid" mathematically
+    \item Are all useless for relative value
+\end{itemize}
+
+\textbf{Solution}: Aggregate to sector-rating level where you have many bonds.
+\end{warnbox}
+
+\subsubsection{Two-Track System: Decision Logic}
+
+\begin{implbox}
+\textbf{For each issuer in your universe:}
+
+\begin{algorithm}[H]
+\caption{Curve Selection Logic}
+\begin{algorithmic}[1]
+\STATE Get all bonds for issuer
+\STATE $N_{\text{bonds}} \gets $ count of bonds
+\IF{$N_{\text{bonds}} \geq 3$}
+    \STATE \textbf{Build ISSUER-SPECIFIC curve} for this issuer
+    \STATE Use $Q_{\text{issuer}}(t)$ for all bonds of this issuer
+\ELSE
+    \STATE \textbf{Flag bonds for SECTOR-RATING curve}
+    \STATE Use $Q_{\text{sector,rating}}(t)$ when available
+\ENDIF
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Track 1: Large Issuers (Issuer Curves)}
+
+Examples: Apple (8 bonds), Microsoft (12 bonds), BAC (25 bonds)
+
+Process:
+\begin{lstlisting}
+For AAPL:
+  - Collect 8 Apple bonds
+  - Fit curve: Q_AAPL(t; theta*)
+  - Use for all 8 Apple bonds
+  - Most accurate (issuer-specific)
+\end{lstlisting}
+
+\textbf{Track 2: Small Issuers (Sector-Rating Curves)}
+
+Examples: Oracle (1 bond), Tesla (2 bonds), Netflix (1 bond)
+
+Process:
+\begin{lstlisting}
+For Oracle (1 bond):
+  - Cannot fit issuer curve
+  - Oracle is Technology + A rating
+  - Use Technology-A sector curve
+  - Calculate: s_Oracle - s_TechA(5Y)
+\end{lstlisting}
+\end{implbox}
+
+\subsubsection{Complete Build Timeline}
+
+\begin{keybox}
+\textbf{Staged Approach}: Build issuer curves FIRST, then sector curves.
+
+\textbf{Why this order?}
+\begin{enumerate}
+    \item Issuer curves easier to understand (1 issuer = 1 curve)
+    \item Better data quality (large, liquid issuers)
+    \item Tests optimization code on best data
+    \item Produces highest-quality signals immediately
+    \item Sector curves fill coverage gaps afterward
+\end{enumerate}
+\end{keybox}
+
+\textbf{Week 1: Foundation}
+
+\begin{enumerate}
+    \item Data loaders
+    \begin{itemize}
+        \item Bond prices, coupons, maturities, ratings, sectors
+        \item Treasury curves (spot rates at standard tenors)
+        \item Data validation (no nulls, prices 50-150 range)
+    \end{itemize}
+    
+    \item Risk-free curve $B(t)$ interpolation
+    \begin{itemize}
+        \item Implement RiskFreeCurve class
+        \item Test: $B(0) = 1$, $B(t)$ monotonic decreasing
+        \item Forward rate $f(t) > 0$ for all $t$
+    \end{itemize}
+\end{enumerate}
+
+\textbf{Deliverable}: Data infrastructure, can load bonds and treasury curves.
+
+\vspace{0.5cm}
+
+\textbf{Week 2: Issuer Curves - Core Mechanics}
+
+\begin{enumerate}
+    \setcounter{enumi}{2}
+    \item Hazard rate classes
+    \begin{itemize}
+        \item Implement ExponentialHazard class
+        \item Methods: \texttt{hazard\_rate(t)}, \texttt{survival\_prob(t)}
+        \item Validation: $Q(0) = 1$, $Q(t)$ decreasing, $\lambda(t) > 0$
+    \end{itemize}
+    
+    \item Numerical integration: $\Pi$, $\Xi$, $r_b$
+    \begin{itemize}
+        \item Trapezoid rule on quarterly grid
+        \item \textbf{Critical test}: Parity equation $B(T)Q(T) + \Xi(T) + r_b(T)\Pi(T) = 1.0$
+        \item Must pass within tolerance $10^{-6}$
+    \end{itemize}
+    
+    \item Bond pricing function
+    \begin{itemize}
+        \item Price = Coupon PV + Principal PV + Recovery PV
+        \item Test: Risk-free bond $(Q \equiv 1)$ matches Treasury
+    \end{itemize}
+    
+    \item Optimization engine
+    \begin{itemize}
+        \item Initial guess heuristics
+        \item Levenberg-Marquardt with bounds
+        \item Multiple initial guesses for robustness
+    \end{itemize}
+\end{enumerate}
+
+\textbf{Deliverable}: Complete curve fitting pipeline (for issuers).
+
+\vspace{0.5cm}
+
+\textbf{Week 2 (continued): Fit First Issuer Curves}
+
+\begin{enumerate}
+    \setcounter{enumi}{6}
+    \item Select $\sim$50 large issuers
+    \begin{lstlisting}
+large_issuers = ["AAPL", "MSFT", "JPM", "BAC", "T", ...]
+# Focus on issuers with 5+ bonds for best results
+    \end{lstlisting}
+    
+    \item Fit curves for each issuer
+    \begin{itemize}
+        \item Target RMSE $< 2.0$ points (acceptable first pass)
+        \item Goal RMSE $< 1.0$ points (after refinement)
+        \item Flag any issuer with max residual $> 5$ points (data issue)
+    \end{itemize}
+    
+    \item Validate fitted curves
+    \begin{itemize}
+        \item Plot hazard rates: should be smooth
+        \item Check $\lambda(t) > 0$ for all $t \in [0, 30]$
+        \item Verify $Q(t)$ monotonically decreasing
+    \end{itemize}
+\end{enumerate}
+
+\textbf{Deliverable Week 2}: 
+\begin{itemize}
+    \item 50 issuer curves fitted and validated
+    \item Signals for $\sim$800 bonds (from large issuers)
+    \item RMSE statistics documented
+\end{itemize}
+
+\vspace{0.5cm}
+
+\textbf{Week 3: Sector-Rating Curves}
+
+\begin{implbox}
+\textbf{Goal}: Fill coverage gaps for issuers with $<3$ bonds.
+
+\textbf{Process}:
+
+\textbf{Step 1}: Define sector-rating grid
+\begin{lstlisting}
+SECTORS = [
+    "TECHNOLOGY", "FINANCIALS", "ENERGY", "INDUSTRIALS",
+    "HEALTHCARE", "CONSUMER_DISCRETIONARY", "CONSUMER_STAPLES",
+    "UTILITIES", "TELECOM", "MATERIALS"
+]
+
+RATINGS = ["AAA", "AA", "A", "BBB", "BB", "B", "CCC"]
+
+# Creates 10 x 7 = 70 possible curves
+\end{lstlisting}
+
+\textbf{Step 2}: Collect bonds for each bucket
+
+\begin{lstlisting}
+def get_bonds_for_sector_rating(sector, rating, as_of_date):
+    """
+    Get bonds for sector-rating curve.
+    
+    CRITICAL: Exclude bonds from issuers with own curves!
+    """
+    all_bonds = query_db(sector=sector, rating=rating, date=as_of_date)
+    
+    # Exclusion logic
+    filtered = []
+    for bond in all_bonds:
+        issuer_bond_count = count_issuer_bonds(bond.issuer_id)
+        
+        if issuer_bond_count < 3:
+            # Issuer doesn't have own curve -> include
+            filtered.append(bond)
+        else:
+            # Issuer has own curve -> EXCLUDE (avoid double-counting)
+            pass
+    
+    return filtered
+\end{lstlisting}
+
+\textbf{Why exclude?} Bonds from Apple, Microsoft, etc. already have issuer curves. Including them in sector curves would:
+\begin{itemize}
+    \item Create inconsistency (bond has two curves)
+    \item Bias sector curve toward large issuers
+    \item Reduce signal quality for small issuers
+\end{itemize}
+
+\textbf{Step 3}: Fit curves for each sector-rating
+
+\begin{lstlisting}
+for sector in SECTORS:
+    for rating in RATINGS:
+        bonds = get_bonds_for_sector_rating(sector, rating, as_of_date)
+        
+        if len(bonds) < 3:
+            print(f"Skip {sector}-{rating}: only {len(bonds)} bonds")
+            continue
+        
+        curve = fit_survival_curve(bonds, rf_curve)
+        save_curve(f"{sector}_{rating}", curve)
+        
+        print(f"Fitted {sector}-{rating}: {len(bonds)} bonds, RMSE={curve.rmse}")
+\end{lstlisting}
+
+\textbf{Step 4}: Handle sparse buckets
+
+Some sector-rating combinations have $< 3$ bonds. Fallback hierarchy:
+
+\begin{enumerate}
+    \item \textbf{Combine adjacent ratings}
+    \begin{lstlisting}
+# Example: Technology AA has only 2 bonds
+# Combine: Technology AA + Technology A -> Technology AA/A
+    \end{lstlisting}
+    
+    \item \textbf{Rating-only curve} (all sectors)
+    \begin{lstlisting}
+# Aggregate ALL AAA bonds across sectors
+# Use when sector-specific curve unavailable
+    \end{lstlisting}
+    
+    \item \textbf{Sector-only curve} (all ratings)
+    \begin{lstlisting}
+# Aggregate Technology [AAA, AA, A, BBB]
+# Less common, use sparingly
+    \end{lstlisting}
+\end{enumerate}
+\end{implbox}
+
+\textbf{Deliverable Week 3}:
+\begin{itemize}
+    \item $\sim$40 sector-rating curves (not all 70 buckets will have data)
+    \item Coverage extended to $\sim$2,200 bonds (88\% of universe)
+    \item Fallback curves for sparse buckets
+\end{itemize}
+
+\vspace{0.5cm}
+
+\textbf{Week 4: Integration \& Signal Generation}
+
+\begin{enumerate}
+    \setcounter{enumi}{9}
+    \item Build curve selection logic
+    \begin{lstlisting}
+def get_curve_for_bond(bond):
+    """
+    Get most specific curve available.
+    Priority: issuer > sector-rating > rating > skip
+    """
+    # Priority 1: Issuer curve
+    if bond.issuer_id in issuer_curves:
+        return issuer_curves[bond.issuer_id]
+    
+    # Priority 2: Sector-rating curve
+    key = f"{bond.sector}_{bond.rating}"
+    if key in sector_rating_curves:
+        return sector_rating_curves[key]
+    
+    # Priority 3: Rating-only curve
+    if bond.rating in rating_curves:
+        return rating_curves[bond.rating]
+    
+    # No curve available
+    return None
+    \end{lstlisting}
+    
+    \item Generate signals for full universe
+    \begin{lstlisting}
+signals = []
+for bond in all_bonds:
+    curve = get_curve_for_bond(bond)
+    if curve is None:
+        continue  # Skip bond
+    
+    residual = calculate_spread_residual(bond, curve, rf_curve)
+    signal = generate_signal(bond, residual)
+    signals.append(signal)
+    \end{lstlisting}
+    
+    \item Calculate par-adjusted spreads
+    \begin{itemize}
+        \item For each bond: $s = c - r_b(T) - (P/100 - 1)/\Pi(T)$
+        \item Compare to fitted curve: $\Delta s = s - s_b(T)$
+        \item Z-score normalization using 1Y historical residuals
+    \end{itemize}
+    
+    \item Output formatting
+    \begin{itemize}
+        \item Tag signals with curve type (ISSUER, SECTOR\_RATING, RATING)
+        \item Store in database with timestamps
+        \item Generate monitoring reports
+    \end{itemize}
+\end{enumerate}
+
+\textbf{Deliverable Week 4}:
+\begin{itemize}
+    \item Complete signal coverage (2,200+ bonds)
+    \item Integrated system using best available curve for each bond
+    \item Database populated with daily signals
+\end{itemize}
+
+\subsubsection{Practical Example: Full Universe Coverage}
+
+\begin{examplebox}
+\textbf{Your Bond Universe}: 2,500 bonds total
+
+\textbf{Breakdown by issuer size}:
+
+\vspace{0.3cm}
+\noindent
+\begin{tabular}{lrrp{6cm}}
+\toprule
+\textbf{Category} & \textbf{Issuers} & \textbf{Bonds} & \textbf{Curve Type} \\
+\midrule
+Large issuers & 50 & 800 & Issuer-specific curves \\
+($\geq 3$ bonds) & & & (50 curves) \\
+\midrule
+Medium issuers & 300 & 450 & Sector-rating curves \\
+(1-2 bonds) & & & (40 curves) \\
+\midrule
+Small/illiquid & 600 & 1,250 & Sector-rating or rating curves \\
+& & & (fallback) \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.3cm}
+
+\textbf{Week 2 Output} (Issuer Curves Only):
+
+Coverage: 800 / 2,500 bonds (32\%)
+
+Signals generated:
+\begin{itemize}
+    \item ✓ Apple bonds: using $Q_{\text{AAPL}}(t)$
+    \item ✓ Microsoft bonds: using $Q_{\text{MSFT}}(t)$
+    \item ✓ JPMorgan bonds: using $Q_{\text{JPM}}(t)$
+\end{itemize}
+
+Not covered yet:
+\begin{itemize}
+    \item ✗ Oracle bond (1 bond, no curve yet)
+    \item ✗ Netflix bonds (2 bonds, no curve yet)
+    \item ✗ Regional bank bonds
+\end{itemize}
+
+\vspace{0.3cm}
+
+\textbf{Week 3 Output} (+ Sector-Rating Curves):
+
+Coverage: 2,200 / 2,500 bonds (88\%)
+
+New signals:
+\begin{itemize}
+    \item ✓ Oracle: using $Q_{\text{Tech-A}}(t)$ [sector-rating]
+    \item ✓ Netflix: using $Q_{\text{ConsDisc-BB}}(t)$ [sector-rating]
+    \item ✓ Regional banks: using $Q_{\text{Fin-BBB}}(t)$ [sector-rating]
+\end{itemize}
+
+Still not covered (300 bonds):
+\begin{itemize}
+    \item Small issuers in obscure sector-rating combinations
+    \item Use rating-only curves or skip
+\end{itemize}
+\end{examplebox}
+
+\subsubsection{Master Curve Fitting Script}
+
+\begin{implbox}
+\textbf{Daily Batch Process}: Run this every day to update all curves.
+
+\begin{lstlisting}
+def build_all_curves(as_of_date):
+    """
+    Build both issuer and sector-rating curves.
+    Two-stage process.
+    """
+    rf_curve = load_treasury_curve(as_of_date)
+    
+    # ==========================================
+    # STAGE 1: ISSUER CURVES
+    # ==========================================
+    print("="*60)
+    print("STAGE 1: FITTING ISSUER CURVES")
+    print("="*60)
+    
+    issuer_curves = {}
+    issuer_bond_count = {}
+    
+    all_issuers = get_unique_issuers(as_of_date)
+    
+    for issuer in all_issuers:
+        bonds = get_bonds(issuer, as_of_date)
+        issuer_bond_count[issuer] = len(bonds)
+        
+        if len(bonds) >= 3:
+            try:
+                result = fit_issuer_curve(bonds, rf_curve)
+                issuer_curves[issuer] = result['curve']
+                print(f"OK {issuer:12s}: {len(bonds):2d} bonds, "
+                      f"RMSE={result['rmse']:.2f}")
+            except Exception as e:
+                print(f"ER {issuer:12s}: FAILED - {e}")
+        else:
+            print(f"-- {issuer:12s}: {len(bonds):2d} bonds "
+                  f"(will use sector curve)")
+    
+    print(f"\nIssuer curves fitted: {len(issuer_curves)}")
+    
+    # ==========================================
+    # STAGE 2: SECTOR-RATING CURVES
+    # ==========================================
+    print("\n" + "="*60)
+    print("STAGE 2: FITTING SECTOR-RATING CURVES")
+    print("="*60)
+    
+    sector_rating_curves = {}
+    
+    for sector in SECTORS:
+        for rating in RATINGS:
+            # Collect bonds EXCLUDING those with issuer curves
+            bonds = []
+            for bond in get_bonds_by_sector_rating(sector, rating, 
+                                                     as_of_date):
+                if issuer_bond_count.get(bond.issuer_id, 0) < 3:
+                    bonds.append(bond)
+            
+            if len(bonds) < 3:
+                print(f"-- {sector:18s} {rating:4s}: "
+                      f"{len(bonds):2d} bonds (skip)")
+                continue
+            
+            try:
+                result = fit_survival_curve(bonds, rf_curve)
+                key = f"{sector}_{rating}"
+                sector_rating_curves[key] = result['curve']
+                print(f"OK {sector:18s} {rating:4s}: "
+                      f"{len(bonds):2d} bonds, RMSE={result['rmse']:.2f}")
+            except Exception as e:
+                print(f"ER {sector:18s} {rating:4s}: FAILED - {e}")
+    
+    print(f"\nSector-rating curves fitted: {len(sector_rating_curves)}")
+    
+    # Save all curves
+    save_curves(as_of_date, issuer_curves, sector_rating_curves)
+    
+    return {
+        'issuer_curves': issuer_curves,
+        'sector_rating_curves': sector_rating_curves,
+        'timestamp': as_of_date
+    }
+\end{lstlisting}
+\end{implbox}
+
+%=============================================================================
+\subsection{Implementation Checklist - REVISED}
+%=============================================================================
+
+\begin{implbox}
+\textbf{Complete 4-Week Build Plan}
+
+\textbf{Week 1: Foundation (Days 1-5)}
+\begin{enumerate}
+    \item Data loaders: bonds, treasuries, reference data
+    \item RiskFreeCurve class with $B(t)$ interpolation
+    \item Validation: $B(0)=1$, monotonic, positive forward rates
+\end{enumerate}
+
+\textbf{Week 2: Issuer Curves (Days 6-12)}
+\begin{enumerate}
+    \setcounter{enumi}{3}
+    \item ExponentialHazard class: $\lambda(t)$, $Q(t)$
+    \item Numerical integration: $\Pi$, $\Xi$, $r_b$ + parity validation
+    \item Bond pricing function + testing
+    \item Optimization engine: initial guess, bounds, L-M solver
+    \item \textbf{Fit 50 issuer curves}: RMSE $< 2.0$ target
+    \item Generate signals for 800 bonds (large issuers)
+\end{enumerate}
+
+\textbf{Week 3: Sector-Rating Curves (Days 13-19)}
+\begin{enumerate}
+    \setcounter{enumi}{9}
+    \item Define sector-rating grid (10 sectors $\times$ 7 ratings)
+    \item Implement exclusion logic (avoid double-counting)
+    \item Fit 40 sector-rating curves
+    \item Build fallback curves (rating-only, combined ratings)
+    \item Validation: RMSE targets, coverage statistics
+\end{enumerate}
+
+\textbf{Week 4: Integration \& Production (Days 20-25)}
+\begin{enumerate}
+    \setcounter{enumi}{14}
+    \item Curve selection logic (priority: issuer $>$ sector-rating $>$ rating)
+    \item Signal generation for full universe (2,200+ bonds)
+    \item Par-adjusted spreads, z-scores, residuals
+    \item Database storage, API endpoints
+    \item Monitoring dashboards, alerting
+    \item Documentation and handoff
+\end{enumerate}
+
+\textbf{Deliverables Summary}:
+\begin{itemize}
+    \item Week 1: Data infrastructure ✓
+    \item Week 2: 50 issuer curves, 800 bond signals ✓
+    \item Week 3: 40 sector curves, coverage to 2,200 bonds ✓
+    \item Week 4: Complete production system ✓
+\end{itemize}
+\end{implbox}
+
+\end{document}
+

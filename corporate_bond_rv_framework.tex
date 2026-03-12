@@ -1,0 +1,899 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,longtable,tabularx,array}
+\usepackage[table]{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{graphicx}
+
+\definecolor{Accent}{HTML}{1F4E79}
+\definecolor{AccentGreen}{HTML}{548235}
+\definecolor{LightBlue}{HTML}{DDEBF7}
+\definecolor{LightGreen}{HTML}{E2F0D9}
+\definecolor{LightGray}{HTML}{F3F4F6}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=Accent,
+  urlcolor=Accent,
+  citecolor=Accent,
+  pdftitle={Corporate Bond Relative Value Signal Framework},
+  pdfauthor={OpenAI}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[R]{Corporate Bond Relative Value Signal Framework}
+\fancyfoot[C]{\thepage}
+\setlength{\headheight}{14pt}
+
+\setlist[itemize]{topsep=3pt,itemsep=3pt,leftmargin=1.6em}
+\setlength{\parskip}{6pt}
+\setlength{\parindent}{0pt}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\newcommand{\notebox}[2]{%
+\begin{center}
+\setlength{\fboxsep}{8pt}
+\fcolorbox{Accent}{LightBlue}{%
+\begin{minipage}{0.94\linewidth}
+\textbf{\color{Accent}#1}\par\medskip
+#2
+\end{minipage}}
+\end{center}}
+
+\newcommand{\greenbox}[2]{%
+\begin{center}
+\setlength{\fboxsep}{8pt}
+\fcolorbox{AccentGreen}{LightGreen}{%
+\begin{minipage}{0.94\linewidth}
+\textbf{\color{AccentGreen}#1}\par\medskip
+#2
+\end{minipage}}
+\end{center}}
+
+\newcommand{\formulabox}[1]{%
+\begin{center}
+\setlength{\fboxsep}{8pt}
+\fcolorbox{black!20}{LightGray}{%
+\begin{minipage}{0.94\linewidth}
+#1
+\end{minipage}}
+\end{center}}
+
+\title{\textbf{\color{Accent}Corporate Bond Relative Value Signal Framework}\\[4pt]
+\large Cash-bond Core Design and CDS Extension for Historical and Live Mispricing Signals}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document designs a production-grade framework for relative-value signals in corporate bonds. The objective is to identify spread mispricings historically and live, and publish clean fair-value outputs into a quoting engine. Quoting logic itself---inventory skew, client-specific markup, and RFQ response policy---is out of scope. The framework is split into two parts. Part I describes what to build when CDS data is not available: issuer curves, sector/rating/tenor benchmark curves, residual-based relative value, carry and rolldown, spread compression and decompression, and live fair-value blending using bond-market proxies. Part II describes how to extend the stack when CDS becomes available: survival-curve anchoring, bond-CDS basis, faster live updates, and new basis strategies.
+\end{abstract}
+
+\notebox{Framework in one sentence}{
+Build one canonical curve and fair-value stack, then derive all strategies as controlled views of the same residual structure. The cash-bond MVP is self-sufficient; the CDS layer is an upgrade, not a replacement.
+}
+
+\tableofcontents
+\newpage
+
+\section{Design objective and scope}
+
+The goal is to build a reusable signal engine for the corporate bond space. The engine should:
+\begin{itemize}
+    \item run historically and live using the same core analytics library;
+    \item identify bonds or baskets that are rich or cheap to fair value;
+    \item support bond RV, curve trades, sector long/short, rating-bucket long/short, and compression/decompression trades;
+    \item publish a clean, deterministic per-bond signal state to downstream systems;
+    \item remain usable even when same-bond prints are stale.
+\end{itemize}
+
+The engine should \emph{not} be a collection of disconnected models. Instead, all strategies should be expressions of a common state vector:
+\[
+\bigl(\text{observed spread},\ \text{fair spread},\ \text{curve slope},\ \text{carry},\ \text{rolldown},\ \text{risk},\ \text{liquidity},\ \text{confidence}\bigr).
+\]
+
+\section{Strategy taxonomy and required inputs}
+
+\small
+\begin{longtable}{L{2.15cm}L{2.8cm}L{2.35cm}L{3.4cm}L{2.1cm}}
+\rowcolor{LightBlue}
+\textbf{\color{Accent}Strategy family} &
+\textbf{\color{Accent}Trade expression} &
+\textbf{\color{Accent}Primary signal} &
+\textbf{\color{Accent}Core inputs} &
+\textbf{\color{Accent}Typical neutralization} \\
+\toprule
+\endhead
+
+Bond rich / cheap &
+Long cheap bond, short rich peer or hedge benchmark &
+$rv_{i,t}=s^{\mathrm{obs}}_{i,t}-\hat s_{i,t}$ &
+Bond prices, fitted curve, rating, sector, DV01, liquidity &
+Duration, sector, rating, beta \\
+
+Issuer curve steepener / flattener &
+Long one tenor, short another within same issuer &
+$slope_e(T_2)-slope_e(T_1)$ &
+At least 2--3 issuer bonds, same seniority, issuer curve &
+Issuer CS01, duration, liquidity \\
+
+Sector curve steepener / flattener &
+Long one maturity bucket, short another in same sector &
+$\hat s_{\mathrm{sec}}(T_2)-\hat s_{\mathrm{sec}}(T_1)$ &
+Sector/rating curves, tradeable sector baskets &
+Sector DV01, rating mix \\
+
+Rating compression / decompression &
+Long HY vs short IG or reverse at matched tenor &
+Gap between rating curves &
+Monotone rating curve grid, regime state, history &
+Duration, sector, broad beta \\
+
+Sector long / short &
+Long cheap sector basket vs rich sector basket &
+Sector residual to market curve &
+Sector benchmark curves, weights, turnover, liquidity &
+Rating, duration, issuer caps \\
+
+Rating-bucket long / short &
+Long cheap bucket vs rich bucket &
+Bucket residual or gap to adjacent ratings &
+Rating curves, market-implied rating overlay &
+Sector, duration, beta \\
+
+Issuer pair / twin bond &
+Long bond A vs short bond B &
+Residualized pair spread &
+Matched bond characteristics, fair residuals &
+Duration, seniority, optionality \\
+
+Carry + rolldown + convergence &
+Own bonds with positive expected carry-adjusted alpha &
+Carry + rolldown + $\kappa\times RV$ &
+Curve engine, forward RPV01, expected convergence &
+Risk budget, turnover \\
+
+Market-implied rating anomaly &
+Long bonds trading too wide for rating, short too tight &
+$r_i^\ast-r_i^{\mathrm{ext}}$ &
+Rating curves, internal/external rating history &
+Sector, duration \\
+
+Bond-CDS basis (extension) &
+Long cash / short CDS or reverse &
+$basis_{i,t}(T)$ &
+CDS quotes, recovery, bond-CDS basis model &
+CS01, recovery, funding \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\greenbox{Why this taxonomy matters}{
+Spread compression and decompression are not separate pricing models. They are movements in the distance between fitted rating or sector curves. Curve trading is not separate from RV; it is a residualized slope or curvature view of a fitted issuer or sector curve. Sector long/short and rating-bucket long/short are portfolio constructions on top of fair-value residuals.
+}
+
+\section{Canonical variables and fair-value representation}
+
+\subsection{Recommendation on the internal spread coordinate}
+
+Use a survival-curve or par-adjusted spread representation as the internal state variable for fitting and relative value. Keep desk-native measures such as Z-spread, OAS, asset-swap spread, or spread-to-Treasury as \emph{derived views}. This is important because raw yield or Z-spread can mix true credit information with coupon effects, price-to-par effects, and benchmark inconsistencies.
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabularx}{\linewidth}{L{1.6cm}L{4.0cm}Y}
+\rowcolor{LightBlue}
+\textbf{\color{Accent}Symbol} & \textbf{\color{Accent}Meaning} & \textbf{\color{Accent}Why it matters} \\
+\toprule
+$P_{i,t}$ & Observed clean price of bond $i$ & Raw market observable \\
+$Y_{i,t}$ & Observed yield & Desk-facing but not the preferred modeling coordinate \\
+$B(t,T)$ & Risk-free discount factor & Separates rates from credit \\
+$Q_e(t,T)$ & Issuer survival probability curve & Core object for robust fair-value fitting \\
+$s^{PA}_{i,t}$ & Par-adjusted or model-consistent spread & Canonical spread coordinate for RV \\
+$\hat s_{i,t}$ & Fair spread from issuer / benchmark curve stack & Fair-value target \\
+$rv_{i,t}$ & Residual spread $=s^{obs}_{i,t}-\hat s_{i,t}$ & Main RV signal input \\
+$\Pi_i(t,T)$ & RPV01 / forward spread duration & Maps spread gaps into expected P\&L \\
+$IR01_{i,t}$ & Interest-rate DV01 & Rates hedge sizing \\
+$CS01_{i,t}$ & Credit spread DV01 & Credit hedge sizing \\
+$DTS_{i,t}$ & Duration times spread & Useful risk and normalization proxy \\
+$L_{i,t}$ & Liquidity score & Capacity, turnover, confidence \\
+$F_{i,t}$ & Freshness / staleness score & Live source weighting \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\formulabox{
+\textbf{Canonical bond valuation state (conceptual form):}
+\[
+P_{i,t}
+=
+c_i\,\Pi_i(t,T_i;Q_i,B)
++
+100\,B(t,T_i)Q_i(t,T_i)
++
+R_i\,\Xi_i(t,T_i;Q_i,B).
+\]
+Here $c_i$ is the coupon-cashflow rate in spread terms, $\Pi_i$ is the risky PV01 / coupon-leg sensitivity, $\Xi_i$ is the discounted expected recovery leg, and $R_i$ is the recovery assumption.
+}
+
+\subsection{Practical implementation rule}
+
+Publish both the internal fair spread and the desk-native spread. That keeps the signal engine theoretically clean while preserving trader usability.
+
+\section{Part I: what to build when CDS is not available}
+
+\subsection{Universe and data filters}
+
+Start with a deliberately homogeneous universe:
+\begin{itemize}
+    \item fixed-rate corporate bonds in one reporting currency;
+    \item consistent benchmark curve convention;
+    \item point-in-time ratings, sectors, issuer mappings, and amount outstanding;
+    \item senior unsecured bullets as the initial production set.
+\end{itemize}
+
+For the MVP, exclude floaters, convertibles, perpetuals, defaulted instruments, and deeply distressed names. Treat callables only once OAS handling is fully trusted. Do \emph{not} mix capital-structure layers inside the same issuer curve. Seniority differences contaminate the curve with a capital-structure premium.
+
+\notebox{Minimum viable security master}{
+Bond identifiers (CUSIP / ISIN), issuer id, parent id, guarantor id, sector, subsector, country, currency, seniority, callable flag, amount outstanding, point-in-time ratings, and benchmark-curve assignment with effective dates.
+}
+
+\subsection{Curve stack without CDS}
+
+The cash-bond-only stack should contain four layers:
+
+\begin{itemize}
+    \item \textbf{Layer A: Issuer curve.} Used when the issuer has enough tradeable bonds of comparable seniority and optionality.
+    \item \textbf{Layer B: Sector/rating/tenor benchmark surface.} Used everywhere as the default fallback and as the shrinkage target.
+    \item \textbf{Layer C: Market and sector factors.} Used to explain broad spread beta and to support compression / decompression trades.
+    \item \textbf{Layer D: Related-bond live translation.} Used intraday when a sister bond is fresher than the target bond.
+\end{itemize}
+
+\formulabox{
+\textbf{Recommended hierarchical fair spread:}
+\[
+\hat s_{i,t}
+=
+\lambda_{i,t}\,\hat s_{\mathrm{issuer}}(e(i),T_i,t)
++
+(1-\lambda_{i,t})\,\hat s_{\mathrm{sector}}(\mathrm{sec}(i),r(i),T_i,t)
++
+\delta_{i,t}.
+\]
+Here $\lambda_{i,t}$ increases in issuer-curve quality, number of bonds, liquidity, and fit stability. The term $\delta_{i,t}$ captures persistent bond-specific effects such as coupon, liquidity premium, and benchmark basis.
+}
+
+The sector/rating surface should be fitted jointly across ratings with monotonicity constraints so that rating curves do not cross, and with smoothness across tenor so that residuals are interpretable instead of being artifacts of overfitting.
+
+\subsection{Why issuer-conditioned curve analysis is mandatory}
+
+Matched-bond evidence shows that when credit quality is held constant within an issuer, speculative-grade credit curves are often upward sloping rather than downward sloping. Pooled regressions by broad rating bucket can show the opposite because safer names within a rating bucket tend to issue longer bonds. Therefore:
+\begin{itemize}
+    \item issuer curve trades and issuer fair values should be estimated issuer-by-issuer first;
+    \item only then should they be shrunk to sector/rating benchmarks;
+    \item issuer slope signals should use matched seniority and, ideally, comparable optionality.
+\end{itemize}
+
+\subsection{Signal definitions for the cash-bond core}
+
+\subsubsection*{Bond rich / cheap to fair curve}
+
+\formulabox{
+\[
+rv_{i,t} = s^{\mathrm{obs}}_{i,t} - \hat s_{i,t},
+\qquad
+zrv_{i,t} = \frac{rv_{i,t}-\mu_{\mathrm{group},t}}{\sigma_{\mathrm{group},t}}.
+\]
+
+Long-only cheap score:
+\[
+score^{cheap}_{i,t} = +zrv_{i,t}.
+\]
+
+Short-only rich score:
+\[
+score^{rich}_{i,t} = -zrv_{i,t}.
+\]
+}
+
+Compute the residual relative to the best available fair curve, not relative to a raw peer average. Standardize residuals inside a comparable group such as sector $\times$ rating $\times$ tenor bucket.
+
+\subsubsection*{Carry, rolldown, and convergence}
+
+\formulabox{
+\[
+carry_i(\Delta t)
+=
+c_i'\Delta t
++
+\bigl(s^{\mathrm{obs}}_{i,t}-c_i'\bigr)\bigl(\Pi_i(T_i)-\Pi_i(T_i-\Delta t)\bigr),
+\]
+\[
+rolldown_i(\Delta t)
+=
+\bigl(\hat s_{i,t}(T_i)-\hat s_{i,t}(T_i-\Delta t)\bigr)\Pi_i(T_i-\Delta t),
+\]
+\[
+rv\_alpha_i(\Delta t)
+=
+\kappa_i\bigl(s^{\mathrm{obs}}_{i,t}-\hat s_{i,t}(T_i)\bigr)\Pi_i(T_i-\Delta t).
+\]
+}
+
+The accounting rule is important: \emph{do not double-count rolldown and RV}. If the convergence payoff is realized at the end of the horizon, the RV term should use forward spread duration, not today's duration.
+
+\subsubsection*{Issuer curve steepener / flattener}
+
+\formulabox{
+\[
+slope_{e,t}(T_1,T_2)=\hat s_{e,t}(T_2)-\hat s_{e,t}(T_1),
+\]
+\[
+signal^{slope}_{e,t}
+=
+z\!\left(slope_{e,t}(T_1,T_2)-slope^{benchmark}_{e,t}(T_1,T_2)\right).
+\]
+}
+
+The benchmark slope can be the issuer's own history, peer issuers, or the sector/rating surface. Within an issuer, prefer matched seniority and similar optionality; otherwise the trade is no longer a pure curve RV trade.
+
+\subsubsection*{Sector and rating compression / decompression}
+
+\formulabox{
+\[
+Comp_t(r_1,r_2,T)=\hat s_t(r_2,T)-\hat s_t(r_1,T),
+\]
+\[
+signal^{comp}_t
+=
+z\!\left(Comp_t(r_1,r_2,T)-\mu^{hist}_t(r_1,r_2,T)\right).
+\]
+}
+
+Compression is the narrowing of the spread gap between lower-quality and higher-quality curves. Decompression is the widening of that gap. The same construction applies by sector, region, or sovereign-adjusted bucket.
+
+\subsubsection*{Sector long / short and rating-bucket long / short}
+
+\formulabox{
+\[
+SecRV_{\mathrm{sec},t}(r,T)
+=
+\hat s_{\mathrm{sec},t}(r,T)-\hat s_{\mathrm{market},t}(r,T),
+\]
+\[
+BucketRV_{i,t}
+=
+rv_{i,t}
+-
+\overline{rv}_t\bigl[\mathrm{sector}(i),\mathrm{rating}(i),\mathrm{tenorBucket}(i)\bigr].
+\]
+}
+
+Sector long/short should usually be sector-neutral to rates and broad credit beta. Rating-bucket long/short should usually be sector-neutral so that the trade expresses rating rather than sector composition.
+
+\subsubsection*{Market-implied rating signal}
+
+\formulabox{
+\[
+r^\ast_{i,t}
+=
+\arg\min_r \left| s^{\mathrm{obs}}_{i,t}-\hat s_{\mathrm{sector},t}(r,T_i)\right|,
+\qquad
+ratingGap_{i,t}=r^\ast_{i,t}-r^{ext}_{i,t}.
+\]
+}
+
+A positive gap means the market trades the bond like a weaker rating than the external label. This is primarily a screening signal; it should be combined with liquidity and event filters before trading.
+
+\subsection{Ranking signal candidates by implementation value}
+
+A 25 bp residual is not automatically better than a 10 bp residual. Implementation cost, liquidity, and model error matter.
+
+\formulabox{
+\[
+\alpha^{net}_{i,t}
+=
+\alpha^{gross}_{i,t}
+-
+TC_{i,t}
+-
+\lambda_{turnover}\,TO_{i,t}
+-
+\lambda_{liq}/L_{i,t},
+\]
+\[
+productionScore_{i,t}
+=
+\frac{\alpha^{net}_{i,t}}{\sigma_{\alpha,i,t}+\lambda_{model}\sigma_{fit,i,t}}.
+\]
+}
+
+The fair-value engine should publish both the raw residual and an implementation-adjusted score. Confidence should be a separate number in $[0,1]$ so that the quoting engine can decide how much to trust the signal.
+
+\subsection{Historical engine without CDS}
+
+Historical runs must be snapshot-based and point-in-time. Rebuild the state that was knowable at each timestamp rather than replaying with today's security master. Store, per date:
+\begin{itemize}
+    \item bond-level observed state,
+    \item fitted issuer curves,
+    \item fitted sector/rating curves,
+    \item residuals and risk measures,
+    \item source diagnostics and model version.
+\end{itemize}
+
+Use the same analytics library for backtests and production. Only the scheduler and the data adapters should differ.
+
+\subsection{Live engine without CDS}
+
+Without CDS, the live engine still works. The problem is not ``fit a fresh issuer curve from scratch every second.'' The problem is ``blend the best available live information into a fair spread.''
+
+\formulabox{
+\textbf{Same-bond TRACE update:}
+\[
+\hat p^{trace}_k(t) = p_k + \Delta p_{rates}(t_k,t) + \Delta p_{spread}(t_k,t).
+\]
+
+\textbf{Staleness weight:}
+\[
+w_{age}(t_k,t)=\exp\!\left(-\ln(2)\frac{t-t_k}{\tau_{trace}}\right).
+\]
+
+\textbf{Size weight:}
+\[
+w_{size}(s_k)=\min\!\left(1,\left(\frac{s_k}{s_{ref}}\right)^\alpha\right).
+\]
+}
+
+If the target bond has not traded recently, translate the latest move from a related issuer bond through the issuer curve. If neither the target bond nor a sister bond is fresh, fall back to ETF or sector-proxy beta for direction and the last trusted curve level for absolute anchoring.
+
+\subsection{Outputs from the cash-bond signal engine}
+
+\begin{verbatim}
+{
+  bond_id, timestamp, fair_spread_bp, fair_price,
+  observed_spread_bp, rv_bp, rv_z,
+  carry_1m_bp, rolldown_1m_bp, alpha_1m_bp,
+  primary_signal_family, confidence_0_1, freshness_seconds,
+  dominant_source,
+  ir01, cs01, dts, liquidity_tier,
+  hedge_tenor, hedge_ratio_cs01,
+  explain_flags[]
+}
+\end{verbatim}
+
+\section{Part II: how to extend the framework when CDS is available}
+
+CDS should be treated as an upgrade to the state space, not as a replacement for the cash-bond framework. The cash-bond curve stack remains the anchor for issuer, sector, and portfolio RV. CDS adds speed, cleaner single-name credit information, and new tradable basis signals.
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabularx}{\linewidth}{L{3.0cm}Y Y}
+\rowcolor{LightBlue}
+\textbf{\color{Accent}Capability} & \textbf{\color{Accent}Cash-bond core} & \textbf{\color{Accent}With CDS extension} \\
+\toprule
+Single-name live credit move &
+Indirect: TRACE, composites, sister bonds, ETF proxies &
+Direct: liquid CDS can update the single-name credit state in seconds \\
+
+Curve anchoring &
+Issuer and sector/rating bond curves &
+Blend bond curves with CDS survival curve or CDS-implied par spread \\
+
+Stale-print correction &
+Related bond or ETF beta move &
+CDS move plus estimated bond-CDS basis move \\
+
+New strategies &
+Bond RV, curve, sector, rating, carry/rolldown &
+Add bond-CDS basis, CDS-led decompression, CDS-vs-cash curve mismatch \\
+
+Extrapolation when cash bonds are sparse &
+Shrink strongly to sector/rating benchmark &
+Use 5Y CDS as issuer anchor and translate along issuer curve \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Additional data and conventions}
+
+Store raw CDS quotes with tenor, coupon, upfront or running format, bid/ask, quote time, recovery convention, restructuring clause, and source. Normalize everything into a standard internal representation:
+\begin{itemize}
+    \item clean par spread curve;
+    \item implied survival curve under a chosen recovery convention;
+    \item point-in-time contract metadata.
+\end{itemize}
+
+\greenbox{CDS data model additions}{
+\texttt{reference\_entity\_id, cds\_tenor, cds\_par\_spread, cds\_upfront, recovery\_assumption, restructuring\_clause, roll\_date, source, quote\_time, liquidity\_score, basis\_model\_version, implied\_survival\_curve\_id, bond\_to\_cds\_link\_quality}
+}
+
+\subsection{CDS-aware fair spread and bond-CDS basis}
+
+\formulabox{
+\[
+basis_{i,t}(T)
+=
+s^{PA}_{bond,i,t}(T)-s^{par}_{cds,i,t}(T).
+\]
+\[
+\hat s^{(cds\rightarrow cash)}_{i,t}(T)
+=
+s^{par}_{cds,i,t}(T^\ast)
++
+\widehat{basis}_{i,t}(T)
++
+\Delta \widehat{curve}_{i,t}(T^\ast,T).
+\]
+}
+
+If liquidity is concentrated in 5Y CDS, treat the 5Y point as the fast issuer state variable and translate from 5Y to other tenors with the issuer curve or benchmark curve. Do not assume bond-CDS basis is constant across time and tenor; model it explicitly and penalize unstable names.
+
+\subsection{CDS for live stale-price correction}
+
+\formulabox{
+\[
+\hat p_{bond}(t)
+=
+p_{bond}(t_0)
+-
+SDV01_i\Bigl(\Delta s_{cds}(t_0,t)+\Delta \widehat{basis}_i(t_0,t)\Bigr),
+\]
+or equivalently in spread space,
+\[
+\hat s_{bond}(t)
+=
+s_{bond}(t_0)
++
+\Delta s_{cds}(t_0,t)
++
+\Delta \widehat{basis}_i(t_0,t).
+\]
+}
+
+This is the cleanest way to move a stale bond print in live markets when CDS is liquid. Rates still move separately through the benchmark curve; do not bury rates inside the CDS translation.
+
+\subsection{Blending cash and CDS information}
+
+\formulabox{
+\[
+\hat s^{final}_{i,t}
+=
+\frac{\sum_s w^{(s)}_{i,t}\hat s^{(s)}_{i,t}}{\sum_s w^{(s)}_{i,t}},
+\]
+where $s\in\{\text{cash issuer},\text{sector benchmark},\text{sister bond},\text{CDS},\text{ETF}\}$ and a useful weight shape is
+\[
+w^{(s)}_{i,t}
+=
+w^{(s)}_{base}
+\frac{w^{(s)}_{fresh}}{1+\left(\sigma^{(s)}_{conv}/\sigma_{ref}\right)^2 }.
+\]
+}
+
+Weights should depend on source freshness, historical conversion residual volatility, liquidity tier, and current data quality flags. The CDS layer should dominate only when it is both liquid and historically stable for that issuer.
+
+\subsection{New strategy families unlocked by CDS}
+
+\paragraph{Bond-CDS basis long / short.}
+\[
+signal^{basis}_{i,t}=z\!\left(basis_{i,t}(T^\ast)\right).
+\]
+Long cash / short CDS if the basis is unusually positive and expected to mean-revert; short cash / long CDS if it is unusually negative. Risk-manage on CS01 and recovery assumptions, not just notional.
+
+\paragraph{CDS-led decompression and sector stress.}
+\[
+Comp^{cds}_t=\hat s^{cds}_t(r_2,T)-\hat s^{cds}_t(r_1,T),
+\qquad
+\Delta Comp_t = Comp^{cash}_t - Comp^{cds}_t.
+\]
+When CDS moves first, the engine can flag cash bonds likely to catch up.
+
+\paragraph{Cash-vs-CDS curve shape mismatch.}
+\[
+curveBasis_{i,t}(T_1,T_2)
+=
+\bigl[s_{bond}(T_2)-s_{bond}(T_1)\bigr]
+-
+\bigl[s_{cds}(T_2)-s_{cds}(T_1)\bigr].
+\]
+A stable mismatch may be structural; a sudden mismatch is often either an RV opportunity or a data issue.
+
+\subsection{When CDS should not be trusted}
+
+Cut CDS weight sharply when:
+\begin{itemize}
+    \item the single-name CDS quote is wide but illiquid;
+    \item contractual clauses differ materially from the economics of the cash bond;
+    \item recovery assumptions dominate pricing in distressed names;
+    \item CDS is on the parent while the cash bond is effectively a subsidiary risk;
+    \item historical bond-to-CDS conversion residuals are unstable.
+\end{itemize}
+
+\section{Software architecture for historical and live production}
+
+\subsection{Architectural principle}
+
+Use one analytics library and two runtimes:
+\begin{itemize}
+    \item a \textbf{batch historical runtime} for backtests, daily snapshots, and research;
+    \item an \textbf{event-driven live runtime} for intraday fair-value updates and signal publication.
+\end{itemize}
+
+All objects should be versioned and reproducible. The same input snapshot and model version must recreate the same fair spread and signal output. Pricing, fair-value blending, and signal generation should remain separate from quoting logic.
+
+\notebox{Signal stack}{
+\[
+\text{Static data + Market data}
+\rightarrow
+\text{Normalization and risk analytics}
+\rightarrow
+\text{Curve engines}
+\rightarrow
+\text{Fair-value blender}
+\rightarrow
+\text{Signal engine}
+\rightarrow
+\text{History store + Live API to quoting engine}
+\]
+
+The CDS branch attaches to the curve engines and fair-value blender as an optional fast credit state variable.
+}
+
+\subsection{Recommended components}
+
+\small
+\begin{longtable}{L{2.1cm}L{4.0cm}L{3.4cm}L{2.6cm}}
+\rowcolor{LightBlue}
+\textbf{\color{Accent}Component} &
+\textbf{\color{Accent}Responsibility} &
+\textbf{\color{Accent}Typical inputs} &
+\textbf{\color{Accent}Typical outputs} \\
+\toprule
+\endhead
+
+SecurityMaster &
+Point-in-time bond and issuer reference data &
+CUSIP, issuer tree, ratings history, terms &
+As-of bond state \\
+
+MarketDataNormalizer &
+Clean trades, quotes, composites, benchmarks &
+TRACE, quotes, ETFs, Treasuries, CDS &
+Normalized observations \\
+
+RiskEngine &
+Compute spread measures and sensitivities &
+Price, curve, terms &
+DV01, CS01, DTS, forward RPV01 \\
+
+CurveEngine &
+Fit issuer and sector/rating curves &
+Normalized bond observations, weights &
+Curve snapshots, fit diagnostics \\
+
+BasisEngine &
+Estimate bond-CDS and other conversion bases &
+CDS, bonds, related instruments &
+Basis curves, residual diagnostics \\
+
+FairValueBlender &
+Combine sources into final fair spread / price &
+Curves, live sources, freshness scores &
+Fair-value snapshot \\
+
+SignalEngine &
+Transform fair-value state into strategy signals &
+Fair-value snapshot, history, costs &
+Signal snapshot \\
+
+Publisher &
+Serve outputs to live systems and history store &
+Signal snapshot &
+API payloads, tables, logs \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\subsection{Storage model}
+
+A practical storage design is:
+
+\begin{itemize}
+    \item \textbf{Raw / bronze layer}: trades, quotes, composite feeds, benchmarks, CDS quotes, reference-data deltas.
+    \item \textbf{Normalized / silver layer}: cleaned market observations and risk measures with point-in-time joins applied.
+    \item \textbf{Analytics / gold layer}: issuer curves, sector/rating curves, basis surfaces, fair-value snapshots, signal snapshots, diagnostics, and model versions.
+\end{itemize}
+
+Every table should be timestamped by both event time and processing time.
+
+\subsection{Event model for live production}
+
+\formulabox{
+\textbf{Typical event triggers:}
+\begin{itemize}
+    \item new TRACE print,
+    \item composite quote refresh,
+    \item Treasury move beyond threshold,
+    \item sister bond trade,
+    \item CDS quote update,
+    \item rating or reference-data change.
+\end{itemize}
+
+\textbf{Typical recomputation graph:}
+
+source update $\rightarrow$ normalize $\rightarrow$ recompute impacted risk metrics $\rightarrow$ update impacted curves or live proxies $\rightarrow$ blend fair value $\rightarrow$ publish signal delta
+}
+
+\subsection{Suggested Python package layout}
+
+\begin{verbatim}
+credit_rv/
+  data/                 # loaders, schemas, as-of joins
+  market/               # trades, composites, CDS, ETF, rates adapters
+  risk/                 # spread measures, DV01/CS01, forward RPV01
+  curves/               # issuer, sector-rating, hazard, shrinkage
+  basis/                # bond-CDS basis and cross-instrument residuals
+  fair_value/           # source weighting and blending
+  signals/              # RV, curve, sector, rating, carry, basis
+  backtest/             # walk-forward, costs, portfolio construction
+  live/                 # event graph, caches, publication
+  api/                  # downstream payloads
+  config/               # versioned model settings
+\end{verbatim}
+
+\section{Calibration, evaluation, and monitoring}
+
+\subsection{Curve calibration}
+
+\begin{itemize}
+    \item Fit issuer curves on prices with robust losses and issuer-size or liquidity weights.
+    \item Fit sector/rating curves jointly with monotone rating ordering and smooth tenor behavior.
+    \item Shrink sparse issuers toward sector/rating curves rather than forcing unstable issuer curves.
+    \item Track fit RMSE, residual skew, no-crossing violations, and parameter drift.
+\end{itemize}
+
+\subsection{Stability controls inspired by single-issuer curve estimation}
+
+Penalize unstable curves aggressively. If a fitted shape changes too much under small input perturbations, reduce flexibility rather than trusting the fit. In practical production terms:
+\begin{itemize}
+    \item reduce effective degrees of freedom for sparse issuers;
+    \item shrink harder when the issuer fit becomes wavy;
+    \item lower confidence instead of overfitting.
+\end{itemize}
+
+\subsection{Historical signal validation}
+
+\formulabox{
+For each signal family and horizon $\Delta t$, track at minimum:
+\[
+IC_{\Delta t}
+=
+\mathrm{corr}\bigl(score_{i,t}, futureExcessReturn_{i,t\rightarrow t+\Delta t}\bigr),
+\]
+\[
+hitRate
+=
+\mathbb{P}\Bigl(\mathrm{sign}(score_{i,t})=\mathrm{sign}(return_{i,t\rightarrow t+\Delta t})\Bigr),
+\]
+\[
+convergence
+=
+\mathbb{E}\Bigl(-\bigl(rv_{i,t+\Delta t}-rv_{i,t}\bigr)\mathrm{sign}(score_{i,t})\Bigr),
+\]
+\[
+pnl^{net}
+=
+realizedReturn - transactionCosts - carryFunding.
+\]
+}
+
+Evaluate by regime, sector, rating, tenor, liquidity tier, and distressed filter. Walk-forward calibration is mandatory; no global look-ahead fits.
+
+\subsection{Live monitoring}
+
+Track at least:
+\begin{itemize}
+    \item signal freshness and source availability;
+    \item curve residual drift and tail events;
+    \item difference between fair value and subsequent prints or fills;
+    \item dominant-source concentration;
+    \item for CDS names, conversion residual autocorrelation and basis volatility.
+\end{itemize}
+
+\greenbox{Production success criteria}{
+Historically, the signal stack should produce stable, explainable alpha with sensible turnover and a consistent relationship between residual size and future convergence. Live, the engine should maintain an up-to-date fair spread and confidence per bond, publish deterministic outputs, and degrade gracefully when same-bond data goes stale.
+}
+
+\section{Phased build plan}
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabularx}{\linewidth}{L{0.8cm}L{2.1cm}Y L{2.2cm}}
+\rowcolor{LightBlue}
+\textbf{\color{Accent}Phase} & \textbf{\color{Accent}Goal} & \textbf{\color{Accent}What is built} & \textbf{\color{Accent}Deliverable} \\
+\toprule
+1 & Cash-only daily history & Security master, benchmark mapping, issuer/sector curve engine, RV and carry signals, backtest tables & Daily historical signal library \\
+2 & Cash-only live & TRACE/composite ingestion, sister-bond translation, ETF proxy layer, live fair-value blender, API publication & Intraday fair-value feed \\
+3 & CDS extension & CDS normalization, survival-curve stripping, basis model, CDS live updater, basis signals & Cash + CDS blended signal stack \\
+4 & Broaden universe & Callables via OAS, subordinated structures, EM sovereign-adjusted curves, distressed separation & Expanded production coverage \\
+5 & Portfolio and allocation layer & Cross-sectional optimizer, constraint engine, capacity controls, signal blending & Tradable strategy portfolios \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Final design recommendation}
+
+\greenbox{What to build first}{
+Use a cash-bond-only hierarchical curve engine as the foundation. Fit issuer curves where feasible; otherwise fall back to monotone sector/rating curves. Define every strategy from model-consistent spread residuals and forward spread duration. Publish a single per-bond fair-value snapshot with fair spread, fair price, residual, carry, rolldown, expected alpha, risk, confidence, freshness, and dominant source. This becomes the interface to the quoting engine. Add CDS only after the cash stack is reliable; then use CDS as a fast credit state variable, a bond-CDS basis source, and a live stale-price updater.
+}
+
+\appendix
+
+\section{Reference formulas}
+
+\formulabox{
+\[
+rv_{i,t}=s^{obs}_{i,t}-\hat s_{i,t}
+\]
+\[
+slope_{e,t}(T_1,T_2)=\hat s_{e,t}(T_2)-\hat s_{e,t}(T_1)
+\]
+\[
+Comp_t(r_1,r_2,T)=\hat s_t(r_2,T)-\hat s_t(r_1,T)
+\]
+\[
+carry_i(\Delta t)=c_i'\Delta t+\bigl(s^{obs}_{i,t}-c_i'\bigr)\bigl(\Pi_i(T_i)-\Pi_i(T_i-\Delta t)\bigr)
+\]
+\[
+rolldown_i(\Delta t)=\bigl(\hat s_{i,t}(T_i)-\hat s_{i,t}(T_i-\Delta t)\bigr)\Pi_i(T_i-\Delta t)
+\]
+\[
+rv\_alpha_i(\Delta t)=\kappa_i\bigl(s^{obs}_{i,t}-\hat s_{i,t}(T_i)\bigr)\Pi_i(T_i-\Delta t)
+\]
+\[
+basis_{i,t}(T)=s^{PA}_{bond,i,t}(T)-s^{par}_{cds,i,t}(T)
+\]
+\[
+\hat s^{final}_{i,t}=\frac{\sum_s w^{(s)}_{i,t}\hat s^{(s)}_{i,t}}{\sum_s w^{(s)}_{i,t}}
+\]
+}
+
+\section{Source documents used for the design}
+
+\begin{thebibliography}{9}
+
+\bibitem{Martin2024}
+Richard J. Martin,
+\textit{The credit spread curve I: Fundamental concepts, fitting, par-adjusted spread, and expected return},
+2024.
+
+\bibitem{Berndt2023}
+Antje Berndt, Darrell Duffie, and Yichao Zhu,
+\textit{Across-the-Curve Credit Spread Indices},
+2023.
+
+\bibitem{Helwege1998}
+Jean Helwege and Christopher M. Turner,
+\textit{The Slope of the Credit Yield Curve for Speculative-Grade Issuers},
+1998.
+
+\bibitem{Pullirsch2006}
+Rainer Pullirsch,
+\textit{Measuring Credit-Spread Risk on a Single Issuer Basis},
+2006.
+
+\end{thebibliography}
+
+\end{document}
